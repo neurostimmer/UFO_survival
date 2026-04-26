@@ -10,9 +10,67 @@ The original code.org script is preserved verbatim at `original/game.code-org.js
 
 ## Repository state
 
-The repo is currently a clean slate. Only `original/game.code-org.js` exists. Build tooling, source layout, and the runtime shim still need to be created. Do not assume any file paths below exist yet — they describe the **target** structure.
+Day-one TypeScript scaffold landed. The structure described in "Architecture" below now exists in code; this section is the up-to-date map.
 
-When introducing tooling, prefer **Vite + TypeScript** (single small dev dep, native ES modules, no bundler config to maintain). Avoid Phaser/PixiJS/p5.js for the core port; the whole point is hardware-agnosticism without burdensome dependencies. A plain `<canvas>` + Web Audio is enough.
+### Stack (final, see `package.json` for versions)
+
+- **Vite + TypeScript** strict mode, `vite.config.ts` sets `base: './'` so the bundle works under any subpath (Devvit webview, Tauri `tauri://localhost`, GitHub Pages project sites)
+- **Biome** — single tool for lint + format
+- **Vitest** — unit tests
+- **Zero runtime dependencies** — Canvas2D, Web Audio, `requestAnimationFrame`, `KeyboardEvent`, `localStorage`. No Phaser/PixiJS/p5.js.
+- Node 24 LTS installed via winget; `package-lock.json` is committed. Any future CI must use `npm ci`, never `npm install`.
+
+### Dev scripts
+
+| Command | What it does |
+| --- | --- |
+| `npm run dev` | Vite dev server (HMR) at `http://localhost:5173/` |
+| `npm run build` | Typecheck + emit `dist/` |
+| `npm run preview` | Vite preview of built output |
+| `npm run typecheck` | `tsc --noEmit` |
+| `npm run lint` | Biome check |
+| `npm run format` | Biome format-write |
+| `npm test` | Vitest one-shot |
+| `npm run test:watch` | Vitest watch mode |
+| `npm run check-sprites` | Asset audit (Python) |
+| `npm run sync-assets` | Re-copy `assets/` → `public/assets/` after sprite changes |
+
+### File layout (current)
+
+```
+src/
+  main.ts                   # bootstrap + fixed-step accumulator
+  game.ts                   # ported game (state machine, screens as functions)
+  gamelab/
+    index.ts                # barrel + LEFT/CENTER/TOP + randomNumber + setRandomSeed
+    sprite.ts               # Sprite class + createSprite/drawSprite(s) + advanceSprites
+    renderer.ts             # Canvas2D wrapper for background/fill/text/...
+    input.ts                # key state diffing, lowercase-normalized
+    audio.ts                # Web Audio playSound, deferred AudioContext
+    assets.ts               # preload images by name; resolve setAnimation
+    scheduler.ts            # createTickScheduler — pure fixed-step math
+public/assets/              # 25 sprite PNGs + music_loop.mp3 + LICENSE.txt
+                            # NOTE: copies of /assets — run `npm run sync-assets`
+                            # after dropping new sprites in /assets/
+tests/                      # 4 unit-test files (scheduler, random, input, sprite)
+original/                   # frozen code.org source — do not modify
+assets/                     # canonical sprite sources (audit script reads here)
+scripts/                    # check_sprites.py + sync_assets.mjs
+index.html, vite.config.ts, tsconfig.json, biome.json, package.json
+SECURITY.md, .gitignore
+```
+
+### Music
+
+CC0 substitute is bundled at `public/assets/music_loop.mp3` ("8-Bit Epic Space Shooter Music" by HydroGene from opengameart.org). License attribution at `public/assets/music_loop.LICENSE.txt`. The audio shim maps the original `"sound://category_music/clear_evidence_loop1.mp3"` URL to this file.
+
+### Security baseline
+
+CSP meta tag in `index.html`: `default-src 'self'; img-src 'self' data:; media-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'`. `frame-ancestors 'none'` must be set as a deploy-time HTTP response header (cannot be set via meta-tag CSP). Details in `SECURITY.md`.
+
+### Parity verification status
+
+The port typechecks, lints clean, and 21 unit tests pass. **Visual parity vs the original code.org page has not yet been done** — that's the next milestone. Until that's signed off, do not "fix" any of the PARITY-tagged quirks in `src/game.ts`.
 
 ## Architecture: Game Lab compatibility shim, then game on top
 
@@ -31,7 +89,7 @@ Extracted from `original/game.code-org.js` — this is the complete list. Anythi
 - **Drawing**: `drawSprite(s)`, `drawSprites()` (draws every live sprite in creation order), `background(color)`, `fill(color)`, `text(str, x, y)`, `textSize(n)`, `textAlign(h, v)` with constants `LEFT`, `CENTER`, `TOP`, `rgb(r, g, b, a)`.
 - **Input**: `keyDown(name)` (held), `keyWentDown(name)` (edge — true only on the frame the key first goes down). Names used: `up`, `left`, `right`, `w`, `a`, `d`, `1`, `2`, `3`, `r`, `C` (uppercase intentional in source), `space`, `backspace`. `keyWentDown` semantics require per-frame state diffing.
 - **Collision**: `sprite.isTouching(other)`. The original uses default sprite hitboxes — bounding-box collision against the rendered animation frame is faithful enough.
-- **Audio**: `playSound(url, loop)`. Original passes `"sound://category_music/clear_evidence_loop1.mp3"` — that's a code.org internal scheme. Map it to a local asset path or replace with a royalty-free substitute; document the mapping in `src/gamelab/assets.ts`.
+- **Audio**: `playSound(url, loop)`. Original passes `"sound://category_music/clear_evidence_loop1.mp3"` — a code.org internal scheme that doesn't resolve outside Game Lab. The substitution map lives in `src/gamelab/audio.ts` (`URL_MAP`); current target is the bundled CC0 `music_loop.mp3`. The shim defers `AudioContext` until the first user gesture (Chromium autoplay) and queues `playSound` calls made before then.
 - **Random**: `randomNumber(min, max)` — inclusive integer.
 - **Loop**: a top-level `draw()` function called at 30 FPS. The shim should call `draw()` via `requestAnimationFrame` with a fixed 33.33 ms accumulator, not at the monitor refresh rate, or the original tuning (gravity `1.5`, jump `-12`, spawn cadence `100 - difficulty * 25` frames) will drift.
 

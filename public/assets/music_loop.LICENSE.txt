@@ -1,0 +1,15 @@
+music_loop.mp3
+==============
+
+Title:    8-Bit Epic Space Shooter Music
+Author:   HydroGene
+Source:   https://opengameart.org/content/8-bit-epic-space-shooter-music
+License:  Creative Commons Zero (CC0 1.0 Universal)
+          https://creativecommons.org/publicdomain/zero/1.0/
+
+The author has dedicated the work to the public domain by waiving all copyright
+and related or neighboring rights worldwide under the CC0 1.0 deed. Attribution
+is not legally required but is included here as a courtesy.
+
+Acquired: 2026-04-26 for the UFO Survival TypeScript port at
+          https://github.com/neurostimmer/UFO_survival

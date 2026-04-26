@@ -1,0 +1,24 @@
+{
+  "name": "ufo-survival",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check src tests",
+    "format": "biome format --write src tests",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check-sprites": "python scripts/check_sprites.py",
+    "sync-assets": "node scripts/sync_assets.mjs"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.4.13",
+    "typescript": "^6.0.3",
+    "vite": "^8.0.10",
+    "vitest": "^4.1.5"
+  }
+}
