@@ -254,10 +254,13 @@ function drawWin(): void {
   if (keyWentDown('C')) {
     winCon += 25;
     health++;
+    handleDamage();
   }
+}
 }
 
 function drawDifficultySelect(): void {
+  textAlign(LEFT, CENTER);
   backGround.setAnimation('space_1');
   fill('white');
   drawSprites();
