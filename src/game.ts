@@ -138,7 +138,10 @@ function drawGameplay(): void {
   //Fixed an issue where offscreened blocks were only cleared when going downward
   for (let i = blocks.length - 1; i >= 0; i--) {
     const currentBlock = blocks[i];
-    if (currentBlock && (currentBlock.x < -10 || currentBlock.x > 410 || currentBlock.y < -10 || currentBlock.y > 410)) {
+    if (
+      currentBlock &&
+      (currentBlock.x < -10 || currentBlock.x > 410 || currentBlock.y < -10 || currentBlock.y > 410)
+    ) {
       currentBlock.destroy();
       blocks.splice(i, 1);
     }
