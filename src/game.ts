@@ -257,7 +257,6 @@ function drawWin(): void {
     handleDamage();
   }
 }
-}
 
 function drawDifficultySelect(): void {
   textAlign(LEFT, CENTER);
