@@ -8,6 +8,8 @@ let canvasW = 400;
 let canvasH = 400;
 
 let currentFill = '#ffffff';
+// Set by fillLinearGradient(); used by rect() once and stays until fill() resets it.
+let currentFillStyle: string | CanvasGradient | null = null;
 let currentTextSize = 12;
 let currentTextAlignH: CanvasTextAlign = 'left';
 let currentTextBaseline: CanvasTextBaseline = 'alphabetic';
@@ -42,6 +44,7 @@ export function background(color: string): void {
 
 export function fill(color: string): void {
   currentFill = color;
+  currentFillStyle = null;
 }
 
 export function textSize(size: number): void {
@@ -73,4 +76,32 @@ export function rgb(r: number, g: number, b: number, a = 1): string {
   // Original passes a as 0..1 (matches p5 / CSS rgba). Clamp defensively.
   const clamp01 = (n: number) => Math.max(0, Math.min(1, n));
   return `rgba(${r | 0}, ${g | 0}, ${b | 0}, ${clamp01(a)})`;
+}
+
+// Filled rectangle using whatever fill style is currently active — either the
+// solid color set by fill() or the gradient set by fillLinearGradient(). The
+// next fill() call resets back to a solid color.
+export function rect(x: number, y: number, w: number, h: number): void {
+  const c = getCtx();
+  c.save();
+  c.fillStyle = currentFillStyle ?? currentFill;
+  c.fillRect(x, y, w, h);
+  c.restore();
+}
+
+// Sets the active fill to a linear gradient running from (x0,y0) to (x1,y1).
+// Stops are [offset 0..1, CSS color] pairs. Active until the next fill() call.
+export function fillLinearGradient(
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+  stops: Array<[number, string]>,
+): void {
+  const c = getCtx();
+  const grad = c.createLinearGradient(x0, y0, x1, y1);
+  for (const [offset, color] of stops) {
+    grad.addColorStop(offset, color);
+  }
+  currentFillStyle = grad;
 }
