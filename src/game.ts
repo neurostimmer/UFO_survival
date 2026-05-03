@@ -75,7 +75,6 @@ const TELEGRAPH_ALPHA_START = 0.25;
 const TELEGRAPH_ALPHA_END = 0.4;
 const TELEGRAPH_STEEPNESS = 6; // gentle sigmoid
 const FOCUS_END_STEEPNESS = 60; // near-step at the moment of spawn
-const FOCUS_LENGTH_FLOOR = 0.1; // bar shrinks to 10% of the edge in focus phase
 
 export function init(): void {
   backGround = createSprite(200, 200, 400, 400);
@@ -240,28 +239,23 @@ function spawnBlock(): void {
 }
 
 // Phase math for the telegraph indicator. Pure: returns the visual params
-// (peak alpha, sigmoid steepness, length fraction along the edge) for a
-// progress value t in [0, 1] where 0 = just spawned, 1 = about to spawn.
-function indicatorState(t: number): {
-  alphaPeak: number;
-  steepness: number;
-  lengthFraction: number;
-} {
+// (peak alpha, sigmoid steepness) for a progress value t in [0, 1] where
+// 0 = just spawned, 1 = about to spawn. The bar always spans the full edge;
+// the spawn-point cue is left to the enemy itself emerging from that edge.
+function indicatorState(t: number): { alphaPeak: number; steepness: number } {
   if (t < FOCUS_THRESHOLD) {
     const phaseT = t / FOCUS_THRESHOLD;
     return {
       alphaPeak: TELEGRAPH_ALPHA_START + (TELEGRAPH_ALPHA_END - TELEGRAPH_ALPHA_START) * phaseT,
       steepness: TELEGRAPH_STEEPNESS,
-      lengthFraction: 1.0,
     };
   }
   const phaseT = (t - FOCUS_THRESHOLD) / (1 - FOCUS_THRESHOLD);
-  // ease-in: most of the focus shrink happens late so the snap reads as fast.
+  // ease-in: most of the focus change happens late so the snap reads as fast.
   const ease = phaseT * phaseT;
   return {
     alphaPeak: TELEGRAPH_ALPHA_END + (1.0 - TELEGRAPH_ALPHA_END) * ease,
     steepness: TELEGRAPH_STEEPNESS + (FOCUS_END_STEEPNESS - TELEGRAPH_STEEPNESS) * ease,
-    lengthFraction: 1.0 - ease * (1.0 - FOCUS_LENGTH_FLOOR),
   };
 }
 
@@ -283,35 +277,26 @@ function drawSpawnIndicator(): void {
   if (!nextSpawn) return;
   const cadence = 100 - difficulty * 25;
   const t = Math.min(1, count / cadence);
-  const { alphaPeak, steepness, lengthFraction } = indicatorState(t);
+  const { alphaPeak, steepness } = indicatorState(t);
   const stops = sigmoidStops(steepness, alphaPeak);
-  const halfLen = (FIELD / 2) * lengthFraction;
-  const { direction, x: tx, y: ty } = nextSpawn;
+  const { direction } = nextSpawn;
 
   if (direction === 1) {
     // Right edge — bar grows leftward.
-    const top = Math.max(0, ty - halfLen);
-    const bottom = Math.min(FIELD, ty + halfLen);
     fillLinearGradient(FIELD, 0, FIELD - BAR_DEPTH, 0, stops);
-    rect(FIELD - BAR_DEPTH, top, BAR_DEPTH, bottom - top);
+    rect(FIELD - BAR_DEPTH, 0, BAR_DEPTH, FIELD);
   } else if (direction === 2) {
     // Bottom edge — bar grows upward.
-    const left = Math.max(0, tx - halfLen);
-    const right = Math.min(FIELD, tx + halfLen);
     fillLinearGradient(0, FIELD, 0, FIELD - BAR_DEPTH, stops);
-    rect(left, FIELD - BAR_DEPTH, right - left, BAR_DEPTH);
+    rect(0, FIELD - BAR_DEPTH, FIELD, BAR_DEPTH);
   } else if (direction === 3) {
     // Left edge — bar grows rightward.
-    const top = Math.max(0, ty - halfLen);
-    const bottom = Math.min(FIELD, ty + halfLen);
     fillLinearGradient(0, 0, BAR_DEPTH, 0, stops);
-    rect(0, top, BAR_DEPTH, bottom - top);
+    rect(0, 0, BAR_DEPTH, FIELD);
   } else {
     // Top edge — bar grows downward.
-    const left = Math.max(0, tx - halfLen);
-    const right = Math.min(FIELD, tx + halfLen);
     fillLinearGradient(0, 0, 0, BAR_DEPTH, stops);
-    rect(left, 0, right - left, BAR_DEPTH);
+    rect(0, 0, FIELD, BAR_DEPTH);
   }
 }
 
