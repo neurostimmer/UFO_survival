@@ -16,11 +16,13 @@ import {
   drawSprite,
   drawSprites,
   fill,
+  fillLinearGradient,
   keyDown,
   keyWentDown,
   LEFT,
   playSound,
   randomNumber,
+  rect,
   rgb,
   type Sprite,
   TOP,
@@ -60,6 +62,21 @@ let UFO2Icon: Sprite | null = null;
 let coinIcon: Sprite | null = null;
 let enemyIcon: Sprite | null = null;
 
+// Spawn telegraph. The next enemy's direction and target coords are decided
+// one cadence-window in advance so drawSpawnIndicator() can paint a warning
+// red bar on the wall it'll come through.
+type SpawnTarget = { direction: 1 | 2 | 3 | 4; x: number; y: number };
+let nextSpawn: SpawnTarget | null = null;
+
+const FIELD = 400;
+const BAR_DEPTH = 20; // soft-glow falloff distance into the field, px
+const FOCUS_THRESHOLD = 0.67; // first 67% telegraph, last 33% focus
+const TELEGRAPH_ALPHA_START = 0.25;
+const TELEGRAPH_ALPHA_END = 0.4;
+const TELEGRAPH_STEEPNESS = 6; // gentle sigmoid
+const FOCUS_END_STEEPNESS = 60; // near-step at the moment of spawn
+const FOCUS_LENGTH_FLOOR = 0.1; // bar shrinks to 10% of the edge in focus phase
+
 export function init(): void {
   backGround = createSprite(200, 200, 400, 400);
   backGround.setAnimation('space_1');
@@ -86,11 +103,14 @@ export function draw(): void {
 }
 
 function drawGameplay(): void {
+  // Pre-roll the very first spawn on entry to gameplay so the indicator is
+  // already on screen for frame 1 — same telegraph treatment as every later
+  // enemy.
+  if (!nextSpawn) decideNextSpawn();
+
   backGround.setAnimation('space_1');
   UFO1.setAnimation('ufo_1');
   UFO2.setAnimation('ufo_2');
-
-  drawSprite(backGround);
 
   if (keyWentDown('up')) UFO1.velocityY = -12;
   if (keyWentDown('w')) UFO2.velocityY = -12;
@@ -105,7 +125,16 @@ function drawGameplay(): void {
   UFO2.velocityY += 1.5;
   UFO1.velocityY += 1.5;
 
-  drawSprites();
+  // Draw order: background → indicator (under sprites so the player can fly
+  // over it) → all other sprites → HUD. drawSprites() would redraw the
+  // background and clobber the indicator, so we drawSprite each non-bg
+  // sprite manually instead.
+  drawSprite(backGround);
+  drawSpawnIndicator();
+  drawSprite(UFO1);
+  drawSprite(UFO2);
+  drawSprite(coin);
+  for (const b of blocks) drawSprite(b);
 
   textSize(20);
   fill('red');
@@ -167,36 +196,123 @@ function drawGameplay(): void {
   }
 }
 
-function spawnBlock(): void {
-  const newBlock = createSprite(0, 0);
-  newBlock.direction = randomNumber(1, 4);
-  newBlock.scale = 0.2;
+// Pre-rolls direction + entry coords for the next spawn. Called at gameplay
+// entry (so the first enemy gets the same telegraph as all subsequent ones)
+// and at the end of every spawnBlock() to set up the *following* spawn.
+function decideNextSpawn(): void {
+  const direction = randomNumber(1, 4) as 1 | 2 | 3 | 4;
+  let x = 0;
+  let y = 0;
+  if (direction === 1) {
+    x = 410;
+    y = randomNumber(10, 390);
+  } else if (direction === 2) {
+    x = randomNumber(10, 390);
+    y = 410;
+  } else if (direction === 3) {
+    x = -10;
+    y = randomNumber(10, 390);
+  } else {
+    x = randomNumber(10, 390);
+    y = -10;
+  }
+  nextSpawn = { direction, x, y };
+}
 
-  if (newBlock.direction === 1) {
-    newBlock.velocityX = -5;
-    newBlock.x = 410;
-    newBlock.y = randomNumber(10, 390);
-  }
-  if (newBlock.direction === 2) {
-    newBlock.velocityY = -5;
-    newBlock.y = 410;
-    newBlock.x = randomNumber(10, 390);
-  }
-  if (newBlock.direction === 3) {
-    newBlock.velocityX = 5;
-    newBlock.x = -10;
-    newBlock.y = randomNumber(10, 390);
-  }
-  if (newBlock.direction === 4) {
-    newBlock.velocityY = 5;
-    newBlock.y = -10;
-    newBlock.x = randomNumber(10, 390);
-  }
+function spawnBlock(): void {
+  if (!nextSpawn) decideNextSpawn();
+  const target = nextSpawn as SpawnTarget;
+
+  const newBlock = createSprite(target.x, target.y);
+  newBlock.direction = target.direction;
+  newBlock.scale = 0.2;
+  if (target.direction === 1) newBlock.velocityX = -5;
+  else if (target.direction === 2) newBlock.velocityY = -5;
+  else if (target.direction === 3) newBlock.velocityX = 5;
+  else newBlock.velocityY = 5;
 
   const randomIndex = randomNumber(0, shipAnimations.length - 1);
   const name = shipAnimations[randomIndex];
   if (name) newBlock.setAnimation(name);
   blocks.push(newBlock);
+
+  decideNextSpawn();
+}
+
+// Phase math for the telegraph indicator. Pure: returns the visual params
+// (peak alpha, sigmoid steepness, length fraction along the edge) for a
+// progress value t in [0, 1] where 0 = just spawned, 1 = about to spawn.
+function indicatorState(t: number): {
+  alphaPeak: number;
+  steepness: number;
+  lengthFraction: number;
+} {
+  if (t < FOCUS_THRESHOLD) {
+    const phaseT = t / FOCUS_THRESHOLD;
+    return {
+      alphaPeak: TELEGRAPH_ALPHA_START + (TELEGRAPH_ALPHA_END - TELEGRAPH_ALPHA_START) * phaseT,
+      steepness: TELEGRAPH_STEEPNESS,
+      lengthFraction: 1.0,
+    };
+  }
+  const phaseT = (t - FOCUS_THRESHOLD) / (1 - FOCUS_THRESHOLD);
+  // ease-in: most of the focus shrink happens late so the snap reads as fast.
+  const ease = phaseT * phaseT;
+  return {
+    alphaPeak: TELEGRAPH_ALPHA_END + (1.0 - TELEGRAPH_ALPHA_END) * ease,
+    steepness: TELEGRAPH_STEEPNESS + (FOCUS_END_STEEPNESS - TELEGRAPH_STEEPNESS) * ease,
+    lengthFraction: 1.0 - ease * (1.0 - FOCUS_LENGTH_FLOOR),
+  };
+}
+
+// Builds N+1 stops for a 1→0 sigmoid falloff scaled by peakAlpha. offset 0 is
+// the edge (peak), offset 1 is one BAR_DEPTH into the field (≈0).
+function sigmoidStops(steepness: number, peakAlpha: number): Array<[number, string]> {
+  const N = 8;
+  const stops: Array<[number, string]> = [];
+  for (let i = 0; i <= N; i++) {
+    const offset = i / N;
+    const sig = 1 / (1 + Math.exp(steepness * (offset - 0.5)));
+    const a = peakAlpha * sig;
+    stops.push([offset, `rgba(255, 0, 0, ${a.toFixed(3)})`]);
+  }
+  return stops;
+}
+
+function drawSpawnIndicator(): void {
+  if (!nextSpawn) return;
+  const cadence = 100 - difficulty * 25;
+  const t = Math.min(1, count / cadence);
+  const { alphaPeak, steepness, lengthFraction } = indicatorState(t);
+  const stops = sigmoidStops(steepness, alphaPeak);
+  const halfLen = (FIELD / 2) * lengthFraction;
+  const { direction, x: tx, y: ty } = nextSpawn;
+
+  if (direction === 1) {
+    // Right edge — bar grows leftward.
+    const top = Math.max(0, ty - halfLen);
+    const bottom = Math.min(FIELD, ty + halfLen);
+    fillLinearGradient(FIELD, 0, FIELD - BAR_DEPTH, 0, stops);
+    rect(FIELD - BAR_DEPTH, top, BAR_DEPTH, bottom - top);
+  } else if (direction === 2) {
+    // Bottom edge — bar grows upward.
+    const left = Math.max(0, tx - halfLen);
+    const right = Math.min(FIELD, tx + halfLen);
+    fillLinearGradient(0, FIELD, 0, FIELD - BAR_DEPTH, stops);
+    rect(left, FIELD - BAR_DEPTH, right - left, BAR_DEPTH);
+  } else if (direction === 3) {
+    // Left edge — bar grows rightward.
+    const top = Math.max(0, ty - halfLen);
+    const bottom = Math.min(FIELD, ty + halfLen);
+    fillLinearGradient(0, 0, BAR_DEPTH, 0, stops);
+    rect(0, top, BAR_DEPTH, bottom - top);
+  } else {
+    // Top edge — bar grows downward.
+    const left = Math.max(0, tx - halfLen);
+    const right = Math.min(FIELD, tx + halfLen);
+    fillLinearGradient(0, 0, 0, BAR_DEPTH, stops);
+    rect(left, 0, right - left, BAR_DEPTH);
+  }
 }
 
 function drawNonGameplay(): void {
@@ -227,6 +343,7 @@ function drawNonGameplay(): void {
     winCon = 25;
     for (const b of blocks) b.destroy();
     blocks = [];
+    nextSpawn = null;
     difficulty = -1;
   }
 }
