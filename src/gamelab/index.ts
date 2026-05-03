@@ -18,6 +18,7 @@ export {
   background,
   fill,
   fillLinearGradient,
+  fillRadialGradient,
   getCanvasSize,
   rect,
   rgb,
