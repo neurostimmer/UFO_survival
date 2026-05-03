@@ -5,3 +5,11 @@ dist/
 .DS_Store
 .env
 .env.*
+
+# Build output staging + final zips for collaborator handoff.
+release_staging/
+releases/
+
+# Local-only assistant config — not for the public repo.
+CLAUDE.md
+.claude/
