@@ -16,7 +16,7 @@ import {
   drawSprite,
   drawSprites,
   fill,
-  fillLinearGradient,
+  fillRadialGradient,
   keyDown,
   keyWentDown,
   LEFT,
@@ -69,18 +69,19 @@ type SpawnTarget = { direction: 1 | 2 | 3 | 4; x: number; y: number };
 let nextSpawn: SpawnTarget | null = null;
 
 const FIELD = 400;
-const BAR_DEPTH = 20; // soft-glow falloff distance into the field, px
-const FOCUS_THRESHOLD = 0.67; // first 67% telegraph, last 33% focus
-const TELEGRAPH_ALPHA_START = 0.25;
-const TELEGRAPH_ALPHA_END = 0.4;
-const TELEGRAPH_STEEPNESS = 6; // gentle sigmoid
-const FOCUS_END_STEEPNESS = 60; // near-step at the moment of spawn
-// At telegraph the bar's halfLen = FIELD * 1.0 = 400, so the rect extends a
-// full FIELD on either side of the spawn point and always covers [0, FIELD]
-// even with a corner spawn (Canvas2D clips the overhang). At focus end,
-// halfLen = FIELD * FOCUS_LENGTH_FLOOR = 20, narrowing the bar to ~40 px
-// centered on the entry point — roughly 2× the rendered enemy hitbox.
-const FOCUS_LENGTH_FLOOR = 0.05;
+// Gaussian indicator. The marker is a 2D radial Gaussian anchored at the
+// wall-coord nearest the spawn point — the half outside the canvas is
+// naturally clipped, so what's visible is the "edge-bright, fades into the
+// field along the direction of travel" shape. σ shrinks across the entire
+// countdown (no phase split) until the Gaussian collapses to a near-point
+// right as the enemy enters. Peak alpha simultaneously ramps from a moderate
+// pop-in value to fully opaque, compensating the dramatic area shrink so
+// the marker stays perceptible even as it tightens.
+const SIGMA_INITIAL = 25; // 2σ ≈ 50 px → matches "±50 px from spawn point"
+const SIGMA_FINAL = 2; // near-point collapse at moment of spawn
+const ALPHA_PEAK_INITIAL = 0.5;
+const ALPHA_PEAK_FINAL = 1.0;
+const GAUSSIAN_RADIUS_SIGMAS = 3; // outer gradient radius in σ units (~99.7%)
 
 export function init(): void {
   backGround = createSprite(200, 200, 400, 400);
@@ -244,45 +245,33 @@ function spawnBlock(): void {
   decideNextSpawn();
 }
 
-// Phase math for the telegraph indicator. Pure: returns the visual params
-// (peak alpha, sigmoid steepness, length fraction along the edge) for a
-// progress value t in [0, 1] where 0 = just spawned, 1 = about to spawn.
-// The bar is drawn symmetrically around the field center, so lengthFraction
-// = 1.0 always covers the full [0, FIELD] span.
-function indicatorState(t: number): {
-  alphaPeak: number;
-  steepness: number;
-  lengthFraction: number;
-} {
-  if (t < FOCUS_THRESHOLD) {
-    const phaseT = t / FOCUS_THRESHOLD;
-    return {
-      alphaPeak: TELEGRAPH_ALPHA_START + (TELEGRAPH_ALPHA_END - TELEGRAPH_ALPHA_START) * phaseT,
-      steepness: TELEGRAPH_STEEPNESS,
-      lengthFraction: 1.0,
-    };
-  }
-  const phaseT = (t - FOCUS_THRESHOLD) / (1 - FOCUS_THRESHOLD);
-  // ease-in: most of the focus change happens late so the snap reads as fast.
-  const ease = phaseT * phaseT;
+// Single-curve interp for the Gaussian marker. Pure: returns σ and peak α at
+// a progress value t in [0,1] where 0 = just spawned, 1 = about to spawn.
+// Ease-in (t²) so most of the contraction-and-intensify happens late — the
+// marker visibly collapses into the spawn point right as the enemy appears.
+function indicatorState(t: number): { sigma: number; alphaPeak: number } {
+  const ease = t * t;
   return {
-    alphaPeak: TELEGRAPH_ALPHA_END + (1.0 - TELEGRAPH_ALPHA_END) * ease,
-    steepness: TELEGRAPH_STEEPNESS + (FOCUS_END_STEEPNESS - TELEGRAPH_STEEPNESS) * ease,
-    lengthFraction: 1.0 - ease * (1.0 - FOCUS_LENGTH_FLOOR),
+    sigma: SIGMA_INITIAL + (SIGMA_FINAL - SIGMA_INITIAL) * ease,
+    alphaPeak: ALPHA_PEAK_INITIAL + (ALPHA_PEAK_FINAL - ALPHA_PEAK_INITIAL) * ease,
   };
 }
 
-// Builds N+1 stops for a 1→0 sigmoid falloff scaled by peakAlpha. offset 0 is
-// the edge (peak), offset 1 is one BAR_DEPTH into the field (≈0).
-function sigmoidStops(steepness: number, peakAlpha: number): Array<[number, string]> {
-  const N = 8;
+// Builds gradient stops that sample a 2D Gaussian along the radial axis of a
+// canvas radial gradient. Offset 0 = peak (r=0). Offset 1 = outer circle at
+// r = GAUSSIAN_RADIUS_SIGMAS·σ (~0.011 of peak — the natural Gaussian tail).
+// We force the offset=1 stop to alpha 0 so canvas pixels outside the outer
+// circle don't pick up that residual tint over the whole rect.
+function gaussianStops(peakAlpha: number): Array<[number, string]> {
+  const N = 10;
   const stops: Array<[number, string]> = [];
-  for (let i = 0; i <= N; i++) {
+  for (let i = 0; i < N; i++) {
     const offset = i / N;
-    const sig = 1 / (1 + Math.exp(steepness * (offset - 0.5)));
-    const a = peakAlpha * sig;
+    const distInSigma = offset * GAUSSIAN_RADIUS_SIGMAS;
+    const a = peakAlpha * Math.exp(-(distInSigma * distInSigma) / 2);
     stops.push([offset, `rgba(255, 0, 0, ${a.toFixed(3)})`]);
   }
+  stops.push([1, 'rgba(255, 0, 0, 0)']);
   return stops;
 }
 
@@ -290,32 +279,33 @@ function drawSpawnIndicator(): void {
   if (!nextSpawn) return;
   const cadence = 100 - difficulty * 25;
   const t = Math.min(1, count / cadence);
-  const { alphaPeak, steepness, lengthFraction } = indicatorState(t);
-  const stops = sigmoidStops(steepness, alphaPeak);
-  // Bar is centered on the spawn coordinate. halfLen = FIELD at telegraph
-  // guarantees the visible portion always covers [0, FIELD] regardless of
-  // where the spawn point is along the edge — Canvas2D clips the overhang.
-  // In focus phase, halfLen shrinks toward the spawn point.
-  const halfLen = FIELD * lengthFraction;
+  const { sigma, alphaPeak } = indicatorState(t);
+  const stops = gaussianStops(alphaPeak);
+  const radius = GAUSSIAN_RADIUS_SIGMAS * sigma;
   const { direction, x: tx, y: ty } = nextSpawn;
 
+  // Anchor the Gaussian on the wall coordinate (not the spawn x/y, which is
+  // 10 px outside the canvas). Half of the Gaussian falls outside the
+  // canvas and is clipped — the visible half shows the edge-bright fade
+  // into the field along the direction of travel.
+  let cx: number;
+  let cy: number;
   if (direction === 1) {
-    // Right edge — bar centered vertically on ty.
-    fillLinearGradient(FIELD, 0, FIELD - BAR_DEPTH, 0, stops);
-    rect(FIELD - BAR_DEPTH, ty - halfLen, BAR_DEPTH, halfLen * 2);
+    cx = FIELD;
+    cy = ty;
   } else if (direction === 2) {
-    // Bottom edge — bar centered horizontally on tx.
-    fillLinearGradient(0, FIELD, 0, FIELD - BAR_DEPTH, stops);
-    rect(tx - halfLen, FIELD - BAR_DEPTH, halfLen * 2, BAR_DEPTH);
+    cx = tx;
+    cy = FIELD;
   } else if (direction === 3) {
-    // Left edge — bar centered vertically on ty.
-    fillLinearGradient(0, 0, BAR_DEPTH, 0, stops);
-    rect(0, ty - halfLen, BAR_DEPTH, halfLen * 2);
+    cx = 0;
+    cy = ty;
   } else {
-    // Top edge — bar centered horizontally on tx.
-    fillLinearGradient(0, 0, 0, BAR_DEPTH, stops);
-    rect(tx - halfLen, 0, halfLen * 2, BAR_DEPTH);
+    cx = tx;
+    cy = 0;
   }
+
+  fillRadialGradient(cx, cy, radius, stops);
+  rect(0, 0, FIELD, FIELD);
 }
 
 function drawNonGameplay(): void {

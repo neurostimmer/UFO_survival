@@ -105,3 +105,21 @@ export function fillLinearGradient(
   }
   currentFillStyle = grad;
 }
+
+// Sets the active fill to a radial gradient anchored at (cx, cy), running from
+// r=0 (offset 0) to r=radius (offset 1). Pixels outside the outer circle take
+// the color of the offset=1 stop, so callers must terminate stops with alpha 0
+// to avoid bleeding tint across the rest of the rect.
+export function fillRadialGradient(
+  cx: number,
+  cy: number,
+  radius: number,
+  stops: Array<[number, string]>,
+): void {
+  const c = getCtx();
+  const grad = c.createRadialGradient(cx, cy, 0, cx, cy, radius);
+  for (const [offset, color] of stops) {
+    grad.addColorStop(offset, color);
+  }
+  currentFillStyle = grad;
+}
