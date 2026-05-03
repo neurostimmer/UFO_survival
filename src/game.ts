@@ -75,6 +75,12 @@ const TELEGRAPH_ALPHA_START = 0.25;
 const TELEGRAPH_ALPHA_END = 0.4;
 const TELEGRAPH_STEEPNESS = 6; // gentle sigmoid
 const FOCUS_END_STEEPNESS = 60; // near-step at the moment of spawn
+// At telegraph the bar's halfLen = FIELD * 1.0 = 400, so the rect extends a
+// full FIELD on either side of the spawn point and always covers [0, FIELD]
+// even with a corner spawn (Canvas2D clips the overhang). At focus end,
+// halfLen = FIELD * FOCUS_LENGTH_FLOOR = 20, narrowing the bar to ~40 px
+// centered on the entry point — roughly 2× the rendered enemy hitbox.
+const FOCUS_LENGTH_FLOOR = 0.05;
 
 export function init(): void {
   backGround = createSprite(200, 200, 400, 400);
@@ -239,15 +245,21 @@ function spawnBlock(): void {
 }
 
 // Phase math for the telegraph indicator. Pure: returns the visual params
-// (peak alpha, sigmoid steepness) for a progress value t in [0, 1] where
-// 0 = just spawned, 1 = about to spawn. The bar always spans the full edge;
-// the spawn-point cue is left to the enemy itself emerging from that edge.
-function indicatorState(t: number): { alphaPeak: number; steepness: number } {
+// (peak alpha, sigmoid steepness, length fraction along the edge) for a
+// progress value t in [0, 1] where 0 = just spawned, 1 = about to spawn.
+// The bar is drawn symmetrically around the field center, so lengthFraction
+// = 1.0 always covers the full [0, FIELD] span.
+function indicatorState(t: number): {
+  alphaPeak: number;
+  steepness: number;
+  lengthFraction: number;
+} {
   if (t < FOCUS_THRESHOLD) {
     const phaseT = t / FOCUS_THRESHOLD;
     return {
       alphaPeak: TELEGRAPH_ALPHA_START + (TELEGRAPH_ALPHA_END - TELEGRAPH_ALPHA_START) * phaseT,
       steepness: TELEGRAPH_STEEPNESS,
+      lengthFraction: 1.0,
     };
   }
   const phaseT = (t - FOCUS_THRESHOLD) / (1 - FOCUS_THRESHOLD);
@@ -256,6 +268,7 @@ function indicatorState(t: number): { alphaPeak: number; steepness: number } {
   return {
     alphaPeak: TELEGRAPH_ALPHA_END + (1.0 - TELEGRAPH_ALPHA_END) * ease,
     steepness: TELEGRAPH_STEEPNESS + (FOCUS_END_STEEPNESS - TELEGRAPH_STEEPNESS) * ease,
+    lengthFraction: 1.0 - ease * (1.0 - FOCUS_LENGTH_FLOOR),
   };
 }
 
@@ -277,26 +290,31 @@ function drawSpawnIndicator(): void {
   if (!nextSpawn) return;
   const cadence = 100 - difficulty * 25;
   const t = Math.min(1, count / cadence);
-  const { alphaPeak, steepness } = indicatorState(t);
+  const { alphaPeak, steepness, lengthFraction } = indicatorState(t);
   const stops = sigmoidStops(steepness, alphaPeak);
-  const { direction } = nextSpawn;
+  // Bar is centered on the spawn coordinate. halfLen = FIELD at telegraph
+  // guarantees the visible portion always covers [0, FIELD] regardless of
+  // where the spawn point is along the edge — Canvas2D clips the overhang.
+  // In focus phase, halfLen shrinks toward the spawn point.
+  const halfLen = FIELD * lengthFraction;
+  const { direction, x: tx, y: ty } = nextSpawn;
 
   if (direction === 1) {
-    // Right edge — bar grows leftward.
+    // Right edge — bar centered vertically on ty.
     fillLinearGradient(FIELD, 0, FIELD - BAR_DEPTH, 0, stops);
-    rect(FIELD - BAR_DEPTH, 0, BAR_DEPTH, FIELD);
+    rect(FIELD - BAR_DEPTH, ty - halfLen, BAR_DEPTH, halfLen * 2);
   } else if (direction === 2) {
-    // Bottom edge — bar grows upward.
+    // Bottom edge — bar centered horizontally on tx.
     fillLinearGradient(0, FIELD, 0, FIELD - BAR_DEPTH, stops);
-    rect(0, FIELD - BAR_DEPTH, FIELD, BAR_DEPTH);
+    rect(tx - halfLen, FIELD - BAR_DEPTH, halfLen * 2, BAR_DEPTH);
   } else if (direction === 3) {
-    // Left edge — bar grows rightward.
+    // Left edge — bar centered vertically on ty.
     fillLinearGradient(0, 0, BAR_DEPTH, 0, stops);
-    rect(0, 0, BAR_DEPTH, FIELD);
+    rect(0, ty - halfLen, BAR_DEPTH, halfLen * 2);
   } else {
-    // Top edge — bar grows downward.
+    // Top edge — bar centered horizontally on tx.
     fillLinearGradient(0, 0, 0, BAR_DEPTH, stops);
-    rect(0, 0, FIELD, BAR_DEPTH);
+    rect(tx - halfLen, 0, halfLen * 2, BAR_DEPTH);
   }
 }
 
