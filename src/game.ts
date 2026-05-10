@@ -16,11 +16,13 @@ import {
   drawSprite,
   drawSprites,
   fill,
+  fillRadialGradient,
   keyDown,
   keyWentDown,
   LEFT,
   playSound,
   randomNumber,
+  rect,
   rgb,
   type Sprite,
   TOP,
@@ -60,6 +62,27 @@ let UFO2Icon: Sprite | null = null;
 let coinIcon: Sprite | null = null;
 let enemyIcon: Sprite | null = null;
 
+// Spawn telegraph. The next enemy's direction and target coords are decided
+// one cadence-window in advance so drawSpawnIndicator() can paint a warning
+// red bar on the wall it'll come through.
+type SpawnTarget = { direction: 1 | 2 | 3 | 4; x: number; y: number };
+let nextSpawn: SpawnTarget | null = null;
+
+const FIELD = 400;
+// Gaussian indicator. The marker is a 2D radial Gaussian anchored at the
+// wall-coord nearest the spawn point — the half outside the canvas is
+// naturally clipped, so what's visible is the "edge-bright, fades into the
+// field along the direction of travel" shape. σ shrinks across the entire
+// countdown (no phase split) until the Gaussian collapses to a near-point
+// right as the enemy enters. Peak alpha simultaneously ramps from a moderate
+// pop-in value to fully opaque, compensating the dramatic area shrink so
+// the marker stays perceptible even as it tightens.
+const SIGMA_INITIAL = 25; // 2σ ≈ 50 px → matches "±50 px from spawn point"
+const SIGMA_FINAL = 2; // near-point collapse at moment of spawn
+const ALPHA_PEAK_INITIAL = 0.5;
+const ALPHA_PEAK_FINAL = 1.0;
+const GAUSSIAN_RADIUS_SIGMAS = 3; // outer gradient radius in σ units (~99.7%)
+
 export function init(): void {
   backGround = createSprite(200, 200, 400, 400);
   backGround.setAnimation('space_1');
@@ -86,11 +109,14 @@ export function draw(): void {
 }
 
 function drawGameplay(): void {
+  // Pre-roll the very first spawn on entry to gameplay so the indicator is
+  // already on screen for frame 1 — same telegraph treatment as every later
+  // enemy.
+  if (!nextSpawn) decideNextSpawn();
+
   backGround.setAnimation('space_1');
   UFO1.setAnimation('ufo_1');
   UFO2.setAnimation('ufo_2');
-
-  drawSprite(backGround);
 
   if (keyWentDown('up')) UFO1.velocityY = -12;
   if (keyWentDown('w')) UFO2.velocityY = -12;
@@ -105,7 +131,16 @@ function drawGameplay(): void {
   UFO2.velocityY += 1.5;
   UFO1.velocityY += 1.5;
 
-  drawSprites();
+  // Draw order: background → indicator (under sprites so the player can fly
+  // over it) → all other sprites → HUD. drawSprites() would redraw the
+  // background and clobber the indicator, so we drawSprite each non-bg
+  // sprite manually instead.
+  drawSprite(backGround);
+  drawSpawnIndicator();
+  drawSprite(UFO1);
+  drawSprite(UFO2);
+  drawSprite(coin);
+  for (const b of blocks) drawSprite(b);
 
   textSize(20);
   fill('red');
@@ -167,36 +202,110 @@ function drawGameplay(): void {
   }
 }
 
-function spawnBlock(): void {
-  const newBlock = createSprite(0, 0);
-  newBlock.direction = randomNumber(1, 4);
-  newBlock.scale = 0.2;
+// Pre-rolls direction + entry coords for the next spawn. Called at gameplay
+// entry (so the first enemy gets the same telegraph as all subsequent ones)
+// and at the end of every spawnBlock() to set up the *following* spawn.
+function decideNextSpawn(): void {
+  const direction = randomNumber(1, 4) as 1 | 2 | 3 | 4;
+  let x = 0;
+  let y = 0;
+  if (direction === 1) {
+    x = 410;
+    y = randomNumber(10, 390);
+  } else if (direction === 2) {
+    x = randomNumber(10, 390);
+    y = 410;
+  } else if (direction === 3) {
+    x = -10;
+    y = randomNumber(10, 390);
+  } else {
+    x = randomNumber(10, 390);
+    y = -10;
+  }
+  nextSpawn = { direction, x, y };
+}
 
-  if (newBlock.direction === 1) {
-    newBlock.velocityX = -5;
-    newBlock.x = 410;
-    newBlock.y = randomNumber(10, 390);
-  }
-  if (newBlock.direction === 2) {
-    newBlock.velocityY = -5;
-    newBlock.y = 410;
-    newBlock.x = randomNumber(10, 390);
-  }
-  if (newBlock.direction === 3) {
-    newBlock.velocityX = 5;
-    newBlock.x = -10;
-    newBlock.y = randomNumber(10, 390);
-  }
-  if (newBlock.direction === 4) {
-    newBlock.velocityY = 5;
-    newBlock.y = -10;
-    newBlock.x = randomNumber(10, 390);
-  }
+function spawnBlock(): void {
+  if (!nextSpawn) decideNextSpawn();
+  const target = nextSpawn as SpawnTarget;
+
+  const newBlock = createSprite(target.x, target.y);
+  newBlock.direction = target.direction;
+  newBlock.scale = 0.2;
+  if (target.direction === 1) newBlock.velocityX = -5;
+  else if (target.direction === 2) newBlock.velocityY = -5;
+  else if (target.direction === 3) newBlock.velocityX = 5;
+  else newBlock.velocityY = 5;
 
   const randomIndex = randomNumber(0, shipAnimations.length - 1);
   const name = shipAnimations[randomIndex];
   if (name) newBlock.setAnimation(name);
   blocks.push(newBlock);
+
+  decideNextSpawn();
+}
+
+// Single-curve interp for the Gaussian marker. Pure: returns σ and peak α at
+// a progress value t in [0,1] where 0 = just spawned, 1 = about to spawn.
+// Ease-in (t²) so most of the contraction-and-intensify happens late — the
+// marker visibly collapses into the spawn point right as the enemy appears.
+function indicatorState(t: number): { sigma: number; alphaPeak: number } {
+  const ease = t * t;
+  return {
+    sigma: SIGMA_INITIAL + (SIGMA_FINAL - SIGMA_INITIAL) * ease,
+    alphaPeak: ALPHA_PEAK_INITIAL + (ALPHA_PEAK_FINAL - ALPHA_PEAK_INITIAL) * ease,
+  };
+}
+
+// Builds gradient stops that sample a 2D Gaussian along the radial axis of a
+// canvas radial gradient. Offset 0 = peak (r=0). Offset 1 = outer circle at
+// r = GAUSSIAN_RADIUS_SIGMAS·σ (~0.011 of peak — the natural Gaussian tail).
+// We force the offset=1 stop to alpha 0 so canvas pixels outside the outer
+// circle don't pick up that residual tint over the whole rect.
+function gaussianStops(peakAlpha: number): Array<[number, string]> {
+  const N = 10;
+  const stops: Array<[number, string]> = [];
+  for (let i = 0; i < N; i++) {
+    const offset = i / N;
+    const distInSigma = offset * GAUSSIAN_RADIUS_SIGMAS;
+    const a = peakAlpha * Math.exp(-(distInSigma * distInSigma) / 2);
+    stops.push([offset, `rgba(255, 0, 0, ${a.toFixed(3)})`]);
+  }
+  stops.push([1, 'rgba(255, 0, 0, 0)']);
+  return stops;
+}
+
+function drawSpawnIndicator(): void {
+  if (!nextSpawn) return;
+  const cadence = 100 - difficulty * 25;
+  const t = Math.min(1, count / cadence);
+  const { sigma, alphaPeak } = indicatorState(t);
+  const stops = gaussianStops(alphaPeak);
+  const radius = GAUSSIAN_RADIUS_SIGMAS * sigma;
+  const { direction, x: tx, y: ty } = nextSpawn;
+
+  // Anchor the Gaussian on the wall coordinate (not the spawn x/y, which is
+  // 10 px outside the canvas). Half of the Gaussian falls outside the
+  // canvas and is clipped — the visible half shows the edge-bright fade
+  // into the field along the direction of travel.
+  let cx: number;
+  let cy: number;
+  if (direction === 1) {
+    cx = FIELD;
+    cy = ty;
+  } else if (direction === 2) {
+    cx = tx;
+    cy = FIELD;
+  } else if (direction === 3) {
+    cx = 0;
+    cy = ty;
+  } else {
+    cx = tx;
+    cy = 0;
+  }
+
+  fillRadialGradient(cx, cy, radius, stops);
+  rect(0, 0, FIELD, FIELD);
 }
 
 function drawNonGameplay(): void {
@@ -227,6 +336,7 @@ function drawNonGameplay(): void {
     winCon = 25;
     for (const b of blocks) b.destroy();
     blocks = [];
+    nextSpawn = null;
     difficulty = -1;
   }
 }
