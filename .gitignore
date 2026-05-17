@@ -13,3 +13,7 @@ releases/
 # Local-only assistant config — not for the public repo.
 CLAUDE.md
 .claude/
+
+# WebStorm/IntelliJ: ignore the IDE folder except for shared run configs.
+.idea/*
+!.idea/runConfigurations/
