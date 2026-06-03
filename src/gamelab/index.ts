@@ -7,10 +7,20 @@ export { playSound, unlockAudio } from './audio';
 export {
   _injectKeyDown,
   _injectKeyUp,
+  _injectMouseDown,
+  _injectMouseMove,
+  _injectMouseUp,
   _resetForTest,
   attachInput,
+  attachMouse,
   keyDown,
   keyWentDown,
+  mouseClickedIn,
+  mouseDown,
+  mouseOver,
+  mouseWentDown,
+  mouseX,
+  mouseY,
   snapshotTick,
 } from './input';
 export {

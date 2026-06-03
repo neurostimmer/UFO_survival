@@ -29,7 +29,14 @@ import {
   text,
   textAlign,
   textSize,
+  mouseClickedIn,
+  mouseOver,
 } from './gamelab';
+
+export function render_buttons(pos_x:number, pos_y:number, scale_x:number, scale_y:number,before_color, after_color,
+                               text:string, text_size:number) {
+
+}
 
 // Persistent sprites — created once in init().
 let backGround!: Sprite;
@@ -82,6 +89,15 @@ const SIGMA_FINAL = 2; // near-point collapse at moment of spawn
 const ALPHA_PEAK_INITIAL = 0.5;
 const ALPHA_PEAK_FINAL = 1.0;
 const GAUSSIAN_RADIUS_SIGMAS = 3; // outer gradient radius in σ units (~99.7%)
+
+
+// Mouse hit-rects for menu items. Coords are logical canvas pixels (400×400).
+const TITLE_1P_RECT = { x: 60, y: 345, w: 290, h: 25 };
+const TITLE_2P_RECT = { x: 40, y: 365, w: 320, h: 25 };
+const DIFF_EASY_RECT = { x: 90, y: 135, w: 200, h: 30 };
+const DIFF_NORMAL_RECT = { x: 90, y: 185, w: 230, h: 30 };
+const DIFF_HARD_RECT = { x: 90, y: 235, w: 200, h: 30 };
+const HOVER_BG = 'rgba(255, 255, 255, 0.12)';
 
 export function init(): void {
   backGround = createSprite(200, 200, 400, 400);
@@ -378,22 +394,50 @@ function drawDifficultySelect(): void {
   textSize(50);
   text('Select difficulty:', 20, 100);
   textSize(20);
+
+  if (mouseOver(DIFF_EASY_RECT.x, DIFF_EASY_RECT.y, DIFF_EASY_RECT.w, DIFF_EASY_RECT.h)) {
+    fill(HOVER_BG);
+    rect(DIFF_EASY_RECT.x, DIFF_EASY_RECT.y, DIFF_EASY_RECT.w, DIFF_EASY_RECT.h);
+  }
   fill('green');
   text('press 1 for easy', 100, 150);
+
+  if (mouseOver(DIFF_NORMAL_RECT.x, DIFF_NORMAL_RECT.y, DIFF_NORMAL_RECT.w, DIFF_NORMAL_RECT.h))
+  {
+    fill(HOVER_BG);
+    rect(DIFF_NORMAL_RECT.x, DIFF_NORMAL_RECT.y, DIFF_NORMAL_RECT.w, DIFF_NORMAL_RECT.h);
+  }
   fill('yellow');
   text('press 2 for normal', 100, 200);
+
+  if (mouseOver(DIFF_HARD_RECT.x, DIFF_HARD_RECT.y, DIFF_HARD_RECT.w, DIFF_HARD_RECT.h)) {
+    fill(HOVER_BG);
+    rect(DIFF_HARD_RECT.x, DIFF_HARD_RECT.y, DIFF_HARD_RECT.w, DIFF_HARD_RECT.h);
+  }
   fill('red');
   text('press 3 for hard', 100, 250);
-  fill('white');
+
   textSize(15);
   text('Game designed and coded by Hyrum Adams', 50, 300);
   if (players === 1) {
     // PARITY: 1P mode parks UFO2 far offscreen so drawSprites doesn't render it.
-    UFO2.y = -10000;
+    UFO2.y = 10000;
   }
   if (keyWentDown('1')) difficulty = 1;
   if (keyWentDown('2')) difficulty = 2;
   if (keyWentDown('3')) difficulty = 3;
+
+  if (mouseClickedIn(DIFF_EASY_RECT.x, DIFF_EASY_RECT.y, DIFF_EASY_RECT.w, DIFF_EASY_RECT.h)) {
+    difficulty = 1;
+  }
+  if (mouseClickedIn(DIFF_NORMAL_RECT.x, DIFF_NORMAL_RECT.y, DIFF_NORMAL_RECT.w,
+      DIFF_NORMAL_RECT.h)) {
+    difficulty = 2;
+  }
+  if (mouseClickedIn(DIFF_HARD_RECT.x, DIFF_HARD_RECT.y, DIFF_HARD_RECT.w, DIFF_HARD_RECT.h)) {
+    difficulty = 3;
+  }
+
 }
 
 function drawTitle(): void {
@@ -437,8 +481,13 @@ function drawTitle(): void {
   fill('yellow');
   text(`Goal: Get ${winCon} points to win!`, 60, 310);
 
-  fill('orange');
   textSize(18);
+  if (mouseOver(TITLE_1P_RECT.x, TITLE_1P_RECT.y, TITLE_1P_RECT.w, TITLE_1P_RECT.h)) {
+    fill(HOVER_BG);
+    rect(TITLE_1P_RECT.x, TITLE_1P_RECT.y, TITLE_1P_RECT.w, TITLE_1P_RECT.h);
+  }
+  fill('orange');
+
   text('Press SPACE for one player', 70, 350);
   text('Press BACKSPACE for two player!', 50, 370);
 
@@ -474,7 +523,35 @@ function drawTitle(): void {
     // PARITY: 2P mode is encoded as players === 3 (skipping 2 entirely).
     players = 3;
   }
+/*
+
+  Wrap up drawTitle — refactor the existing key handlers into a shared startGame(twoPlayer)
+  closure inside the function so the click branch can reuse it:
+
+      const startGame = (twoPlayer: boolean): void => {
+        ufo1Ico.destroy();
+        ufo2Ico.destroy();
+        coinIco.destroy();
+        enemyIco.destroy();
+        UFOIcon = UFO2Icon = coinIcon = enemyIcon = null;
+        if (twoPlayer) players = 3; // PARITY: 2P encoded as 3.
+        difficulty = -1;
+      };
+
+  if (keyWentDown('space')) startGame(false);
+  if (keyWentDown('backspace')) startGame(true);
+  if (mouseClickedIn(TITLE_1P_RECT.x, TITLE_1P_RECT.y, TITLE_1P_RECT.w, TITLE_1P_RECT.h)) {
+    startGame(false);
+  }
+  if (mouseClickedIn(TITLE_2P_RECT.x, TITLE_2P_RECT.y, TITLE_2P_RECT.w, TITLE_2P_RECT.h)) {
+    startGame(true);
+  }
+
+  (Cross-check against the existing code where players = 3 is currently set in the
+  keyWentDown('backspace') branch — preserve any details like that.)
+  */
 }
+
 
 function handleDamage(): void {
   health--;

@@ -2,9 +2,18 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import {
   _injectKeyDown,
   _injectKeyUp,
+  _injectMouseDown,
+  _injectMouseMove,
+  _injectMouseUp,
   _resetForTest,
   keyDown,
   keyWentDown,
+  mouseClickedIn,
+  mouseDown,
+  mouseOver,
+  mouseWentDown,
+  mouseX,
+  mouseY,
   snapshotTick,
 } from '../src/gamelab';
 
@@ -84,3 +93,59 @@ describe('keyWentDown / keyDown', () => {
     expect(keyDown('w')).toBe(false);
   });
 });
+
+describe('mouse input', () => {
+  it('mouseWentDown fires exactly once for a held click across multiple ticks', () => {
+    _injectMouseDown();
+    snapshotTick();
+    expect(mouseWentDown()).toBe(true);
+    expect(mouseDown()).toBe(true);
+
+    snapshotTick();
+    expect(mouseWentDown()).toBe(false);
+    expect(mouseDown()).toBe(true);
+
+    _injectMouseUp();
+    snapshotTick();
+    expect(mouseWentDown()).toBe(false);
+    expect(mouseDown()).toBe(false);
+  });
+
+  it('a click-and-release inside one tick is still visible for one tick', () => {
+    _injectMouseDown();
+    _injectMouseUp();
+    snapshotTick();
+    expect(mouseWentDown()).toBe(true);
+    expect(mouseDown()).toBe(true);
+
+    snapshotTick();
+    expect(mouseWentDown()).toBe(false);
+    expect(mouseDown()).toBe(false);
+  });
+
+  it('mouseOver hit-tests the current pointer position', () => {
+    _injectMouseMove(50, 50);
+    snapshotTick();
+    expect(mouseOver(40, 40, 20, 20)).toBe(true);
+    expect(mouseOver(0, 0, 20, 20)).toBe(false);
+  });
+
+  it('mouseClickedIn requires click edge AND hit-test', () => {
+    _injectMouseMove(50, 50);
+    _injectMouseDown();
+    snapshotTick();
+    expect(mouseClickedIn(40, 40, 20, 20)).toBe(true);
+    expect(mouseClickedIn(0, 0, 20, 20)).toBe(false);
+
+    snapshotTick(); // edge gone
+    expect(mouseClickedIn(40, 40, 20, 20)).toBe(false);
+  });
+
+  it('mouseX/mouseY reflect the most recent injected position', () => {
+    _injectMouseMove(123, 234);
+    snapshotTick();
+    expect(mouseX()).toBe(123);
+    expect(mouseY()).toBe(234);
+  });
+});
+
