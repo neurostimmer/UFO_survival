@@ -6,6 +6,7 @@ import {
   advanceSprites,
   attachCanvas,
   attachInput,
+  attachMouse,
   createTickScheduler,
   preloadAssets,
   snapshotTick,
@@ -23,6 +24,7 @@ async function main(): Promise<void> {
   }
   attachCanvas(canvas);
   attachInput(window);
+  attachMouse(canvas)
 
   await preloadAssets();
 
