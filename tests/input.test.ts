@@ -148,4 +148,3 @@ describe('mouse input', () => {
     expect(mouseY()).toBe(234);
   });
 });
-

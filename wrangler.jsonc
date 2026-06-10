@@ -1,12 +1,22 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "ufosurv",
+  "main": "worker/index.ts",
   "compatibility_date": "2026-05-10",
   "compatibility_flags": ["nodejs_compat"],
   "assets": {
     "directory": "./dist",
-    "not_found_handling": "single-page-application"
+    "not_found_handling": "single-page-application",
+    // The Worker only runs for the signaling API; everything else (the game
+    // bundle) is served directly from ./dist with no Worker invocation.
+    "run_worker_first": ["/rtc/*"]
   },
+  "durable_objects": {
+    "bindings": [{ "name": "SIGNAL_ROOM", "class_name": "SignalRoom" }]
+  },
+  // SQLite-backed DO classes are required on the Workers Free plan. SignalRoom
+  // keeps no storage, but the class must still be declared this way to run free.
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["SignalRoom"] }],
   "observability": {
     "enabled": true
   }
