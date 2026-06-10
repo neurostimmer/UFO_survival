@@ -89,6 +89,8 @@ The netcode is **host-authoritative**: player 1 runs the single authoritative si
 
 Connections are brokered by a Cloudflare Worker + Durable Object (`worker/`) that does WebRTC signaling only — once the peers are connected, gameplay traffic never touches the server. The signaling backend lives at the **same origin** as the game, so online co-op requires the app to be served from the Worker (`npm run cf:deploy`, or `npm run cf:dev` locally) rather than from GitHub Pages. ICE uses public STUN with no TURN, so a pair behind two symmetric NATs may fail to connect.
 
+> **Deploy note (Durable Objects):** deploy the Worker with `wrangler deploy` (what `npm run cf:deploy` runs). `wrangler versions upload` **cannot** apply a Durable Object migration and fails with error 10211 — so if your Cloudflare build pipeline's deploy command is `wrangler versions upload`, change it to `wrangler deploy`, or apply the migration once locally with `npm run cf:deploy`.
+
 ## Security
 
 CSP meta tag in `index.html` restricts everything to same-origin. `frame-ancestors 'none'` is documented as a deploy-time HTTP response header — GitHub Pages doesn't expose custom headers, so the page is iframable on the live site. See `SECURITY.md` for the full threat model and hardening notes.
