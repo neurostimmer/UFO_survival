@@ -569,6 +569,13 @@ function drawTitle(): void {
   fill('aqua');
   text('Press O to host online co-op', 50, 366);
 
+  if (mouseOver(TITLE_HOST_RECT.x, TITLE_HOST_RECT.y, TITLE_HOST_RECT.w, TITLE_HOST_RECT.h)) {
+    fill(HOVER_BG);
+    rect(TITLE_HOST_RECT.x, TITLE_HOST_RECT.y, TITLE_HOST_RECT.w, TITLE_HOST_RECT.h);
+  }
+  fill('aqua');
+  text('Press O to host online co-op', 50, 391);
+
   // Capture locals after lazy-init so TS narrowing survives across the
   // remaining draw/destroy calls.
   const ufo1Ico = UFOIcon;
