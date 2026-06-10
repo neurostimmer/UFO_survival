@@ -121,15 +121,15 @@ const ALPHA_PEAK_FINAL = 1.0;
 const GAUSSIAN_RADIUS_SIGMAS = 3; // outer gradient radius in σ units (~99.7%)
 
 // Mouse hit-rects for menu items. Coords are logical canvas pixels (400×400).
-const TITLE_1P_RECT = { x: 60, y: 345, w: 290, h: 25 };
-const TITLE_2P_RECT = { x: 40, y: 365, w: 320, h: 25 };
+const TITLE_1P_RECT = { x: 60, y: 318, w: 290, h: 22 };
+const TITLE_2P_RECT = { x: 40, y: 340, w: 320, h: 22 };
 const DIFF_EASY_RECT = { x: 90, y: 135, w: 200, h: 30 };
 const DIFF_NORMAL_RECT = { x: 90, y: 185, w: 230, h: 30 };
 const DIFF_HARD_RECT = { x: 90, y: 235, w: 200, h: 30 };
 const HOVER_BG = 'rgba(255, 255, 255, 0.12)';
 
 // Title "host online" entry + lobby copy-button hit-rects (logical 400×400 px).
-const TITLE_HOST_RECT = { x: 40, y: 385, w: 340, h: 22 };
+const TITLE_HOST_RECT = { x: 40, y: 362, w: 340, h: 22 };
 const COPY_RECT = { x: 80, y: 215, w: 240, h: 28 };
 
 export function init(): void {
@@ -545,7 +545,7 @@ function drawTitle(): void {
   text('- If your health reaches 0, you lose.', 70, 270);
 
   fill('yellow');
-  text(`Goal: Get ${winCon} points to win!`, 60, 310);
+  text(`Goal: Get ${winCon} points to win!`, 60, 296);
 
   textSize(18);
   if (mouseOver(TITLE_1P_RECT.x, TITLE_1P_RECT.y, TITLE_1P_RECT.w, TITLE_1P_RECT.h)) {
@@ -553,21 +553,21 @@ function drawTitle(): void {
     rect(TITLE_1P_RECT.x, TITLE_1P_RECT.y, TITLE_1P_RECT.w, TITLE_1P_RECT.h);
   }
   fill('orange');
-  text('Press SPACE for one player', 70, 350);
+  text('Press SPACE for one player', 70, 322);
 
   if (mouseOver(TITLE_2P_RECT.x, TITLE_2P_RECT.y, TITLE_2P_RECT.w, TITLE_2P_RECT.h)) {
     fill(HOVER_BG);
     rect(TITLE_2P_RECT.x, TITLE_2P_RECT.y, TITLE_2P_RECT.w, TITLE_2P_RECT.h);
   }
   fill('orange');
-  text('Press BACKSPACE for two player!', 50, 370);
+  text('Press BACKSPACE for two player!', 50, 344);
 
   if (mouseOver(TITLE_HOST_RECT.x, TITLE_HOST_RECT.y, TITLE_HOST_RECT.w, TITLE_HOST_RECT.h)) {
     fill(HOVER_BG);
     rect(TITLE_HOST_RECT.x, TITLE_HOST_RECT.y, TITLE_HOST_RECT.w, TITLE_HOST_RECT.h);
   }
   fill('aqua');
-  text('Press O to host online co-op', 50, 391);
+  text('Press O to host online co-op', 50, 366);
 
   // Capture locals after lazy-init so TS narrowing survives across the
   // remaining draw/destroy calls.
