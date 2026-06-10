@@ -1,22 +1,16 @@
 // Public barrel for the online co-op layer. game.ts imports only from here.
 
-export type {
-  BlockSnap,
-  NetMessage,
-  Phase,
-  PlayerInput,
-  Snapshot,
-  SpawnSnap,
-} from './protocol';
-export { decode, encodeInput, encodeSnapshot } from './protocol';
 export {
-  type GuestHandlers,
-  type GuestSession,
-  type HostHandlers,
-  type HostSession,
-  hostSession,
-  joinSession,
-} from './session';
+  type CoinMsg,
+  type DamageMsg,
+  decode,
+  encode,
+  type NetMessage,
+  type PosMsg,
+  type StartMsg,
+  type WaitMsg,
+} from './protocol';
+export { hostSession, joinSession, type Session, type SessionHandlers } from './session';
 
 // Room-code alphabet: omits I/O/0/1/L so a shared code can't be misread.
 const ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';

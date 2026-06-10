@@ -1,14 +1,13 @@
-// WebRTC session orchestration. The host opens the DataChannel and drives the
-// offer; the guest answers. Trickle-ICE candidates flow both ways over the
-// signaling WebSocket until the channel opens, after which input/snapshot
-// traffic is peer-to-peer.
+// WebRTC session orchestration. Symmetric: both roles expose the same
+// send()/onMessage surface — the only asymmetry is that the host creates the
+// offer and the guest answers. Trickle-ICE flows over the signaling WebSocket
+// until the DataChannel opens, after which all game traffic is peer-to-peer.
 //
-// This module is the one piece that can't be unit-tested headlessly (no
-// RTCPeerConnection outside a browser), so it stays deliberately thin: parsing
-// and validation live in protocol.ts / signaling.ts, and this file is just the
-// state-machine wiring.
+// Deliberately thin: parsing/validation live in protocol.ts and signaling.ts;
+// this is just the state-machine wiring (and the one piece that can't be tested
+// headlessly, since there's no RTCPeerConnection outside a browser).
 
-import { decode, encodeInput, encodeSnapshot, type PlayerInput, type Snapshot } from './protocol';
+import { decode, encode, type NetMessage } from './protocol';
 import { connectSignaling, type SignalChannel, type SignalMessage } from './signaling';
 
 // Public STUN only — per the project assumption that ICE is viable. No TURN, so
@@ -17,149 +16,31 @@ import { connectSignaling, type SignalChannel, type SignalMessage } from './sign
 const ICE_SERVERS: RTCIceServer[] = [{ urls: 'stun:stun.l.google.com:19302' }];
 const CHANNEL_LABEL = 'game';
 // Unreliable + unordered: gameplay is latest-wins, so never retransmit a stale
-// input or snapshot — just wait for the next one.
+// position or event — just wait for the next one.
 const CHANNEL_INIT: RTCDataChannelInit = { ordered: false, maxRetransmits: 0 };
 
-export interface HostSession {
-  sendSnapshot(s: Snapshot): void;
+export interface Session {
+  send(msg: NetMessage): void;
   close(): void;
 }
 
-export interface GuestSession {
-  sendInput(i: PlayerInput): void;
-  close(): void;
-}
-
-export interface HostHandlers {
-  onPeerInput(i: PlayerInput): void;
+export interface SessionHandlers {
+  onMessage(msg: NetMessage): void;
   onConnected(): void;
   onDisconnected(): void;
 }
 
-export interface GuestHandlers {
-  onSnapshot(s: Snapshot): void;
-  onConnected(): void;
-  onDisconnected(): void;
+export function hostSession(code: string, h: SessionHandlers): Session {
+  return createSession(code, 'host', h);
 }
 
-// Buffers ICE candidates that arrive before the remote description is set, then
-// flushes them once it is. addIceCandidate before setRemoteDescription throws.
-interface IceQueue {
-  remoteSet: boolean;
-  pending: RTCIceCandidateInit[];
+export function joinSession(code: string, h: SessionHandlers): Session {
+  return createSession(code, 'guest', h);
 }
 
-async function acceptIce(
-  pc: RTCPeerConnection,
-  q: IceQueue,
-  c: RTCIceCandidateInit,
-): Promise<void> {
-  if (q.remoteSet) await pc.addIceCandidate(c);
-  else q.pending.push(c);
-}
-
-async function flushIce(pc: RTCPeerConnection, q: IceQueue): Promise<void> {
-  q.remoteSet = true;
-  for (const c of q.pending) await pc.addIceCandidate(c);
-  q.pending.length = 0;
-}
-
-function wireChannel(
-  channel: RTCDataChannel,
-  onData: (raw: string) => void,
-  onOpen: () => void,
-  onClose: () => void,
-): void {
-  channel.onopen = (): void => onOpen();
-  channel.onclose = (): void => onClose();
-  channel.onmessage = (ev: MessageEvent): void => {
-    if (typeof ev.data === 'string') onData(ev.data);
-  };
-}
-
-function safeClose(
-  channel: RTCDataChannel | null,
-  pc: RTCPeerConnection,
-  signal: SignalChannel,
-): void {
-  try {
-    channel?.close();
-  } catch {
-    /* already closing */
-  }
-  try {
-    pc.close();
-  } catch {
-    /* already closing */
-  }
-  signal.close();
-}
-
-export function hostSession(code: string, h: HostHandlers): HostSession {
+function createSession(code: string, role: 'host' | 'guest', h: SessionHandlers): Session {
   const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-  const channel = pc.createDataChannel(CHANNEL_LABEL, CHANNEL_INIT);
-  const ice: IceQueue = { remoteSet: false, pending: [] };
-  let closed = false;
-
-  const disconnect = (): void => {
-    if (!closed) {
-      closed = true;
-      h.onDisconnected();
-    }
-  };
-
-  // signal is created first so the handlers below can reference it; onSignal is
-  // a hoisted function declaration so onMessage can name it before its body.
-  const signal: SignalChannel = connectSignaling(code, 'host', {
-    onMessage: (m) => void onSignal(m),
-    onClose: () => {},
-    onError: () => {},
-  });
-
-  wireChannel(
-    channel,
-    (raw) => {
-      const msg = decode(raw);
-      if (msg?.t === 'input') h.onPeerInput(msg.i);
-    },
-    h.onConnected,
-    disconnect,
-  );
-
-  pc.onicecandidate = (ev): void => {
-    if (ev.candidate) signal.send({ type: 'ice', candidate: ev.candidate.toJSON() });
-  };
-  pc.onconnectionstatechange = (): void => {
-    if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') disconnect();
-  };
-
-  async function onSignal(m: SignalMessage): Promise<void> {
-    if (m.type === 'peer-joined') {
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      signal.send({ type: 'offer', sdp: offer.sdp ?? '' });
-    } else if (m.type === 'answer') {
-      await pc.setRemoteDescription({ type: 'answer', sdp: m.sdp });
-      await flushIce(pc, ice);
-    } else if (m.type === 'ice') {
-      await acceptIce(pc, ice, m.candidate);
-    }
-  }
-
-  return {
-    sendSnapshot(s: Snapshot): void {
-      if (channel.readyState === 'open') channel.send(encodeSnapshot(s));
-    },
-    close(): void {
-      closed = true;
-      safeClose(channel, pc, signal);
-    },
-  };
-}
-
-export function joinSession(code: string, h: GuestHandlers): GuestSession {
-  const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-  const ice: IceQueue = { remoteSet: false, pending: [] };
+  const ice = { remoteSet: false, pending: [] as RTCIceCandidateInit[] };
   let channel: RTCDataChannel | null = null;
   let closed = false;
 
@@ -170,24 +51,33 @@ export function joinSession(code: string, h: GuestHandlers): GuestSession {
     }
   };
 
-  const signal: SignalChannel = connectSignaling(code, 'guest', {
+  const wire = (ch: RTCDataChannel): void => {
+    channel = ch;
+    ch.onopen = (): void => h.onConnected();
+    ch.onclose = (): void => disconnect();
+    ch.onmessage = (ev: MessageEvent): void => {
+      if (typeof ev.data !== 'string') return;
+      const msg = decode(ev.data);
+      if (msg) h.onMessage(msg);
+    };
+  };
+
+  // The host opens the channel (and so the offer carries it); the guest receives
+  // it via ondatachannel.
+  if (role === 'host') {
+    wire(pc.createDataChannel(CHANNEL_LABEL, CHANNEL_INIT));
+  } else {
+    pc.ondatachannel = (ev): void => wire(ev.channel);
+  }
+
+  // signal is created before the handlers below reference it; onSignal is a
+  // hoisted function declaration so onMessage can name it before its body.
+  const signal: SignalChannel = connectSignaling(code, role, {
     onMessage: (m) => void onSignal(m),
     onClose: () => {},
     onError: () => {},
   });
 
-  pc.ondatachannel = (ev): void => {
-    channel = ev.channel;
-    wireChannel(
-      channel,
-      (raw) => {
-        const msg = decode(raw);
-        if (msg?.t === 'snap') h.onSnapshot(msg.s);
-      },
-      h.onConnected,
-      disconnect,
-    );
-  };
   pc.onicecandidate = (ev): void => {
     if (ev.candidate) signal.send({ type: 'ice', candidate: ev.candidate.toJSON() });
   };
@@ -196,24 +86,48 @@ export function joinSession(code: string, h: GuestHandlers): GuestSession {
   };
 
   async function onSignal(m: SignalMessage): Promise<void> {
-    if (m.type === 'offer') {
+    if (role === 'host' && m.type === 'peer-joined') {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      signal.send({ type: 'offer', sdp: offer.sdp ?? '' });
+    } else if (role === 'guest' && m.type === 'offer') {
       await pc.setRemoteDescription({ type: 'offer', sdp: m.sdp });
-      await flushIce(pc, ice);
+      await flushIce();
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
       signal.send({ type: 'answer', sdp: answer.sdp ?? '' });
+    } else if (role === 'host' && m.type === 'answer') {
+      await pc.setRemoteDescription({ type: 'answer', sdp: m.sdp });
+      await flushIce();
     } else if (m.type === 'ice') {
-      await acceptIce(pc, ice, m.candidate);
+      if (ice.remoteSet) await pc.addIceCandidate(m.candidate);
+      else ice.pending.push(m.candidate);
     }
   }
 
+  async function flushIce(): Promise<void> {
+    ice.remoteSet = true;
+    for (const c of ice.pending) await pc.addIceCandidate(c);
+    ice.pending.length = 0;
+  }
+
   return {
-    sendInput(i: PlayerInput): void {
-      if (channel?.readyState === 'open') channel.send(encodeInput(i));
+    send(msg: NetMessage): void {
+      if (channel?.readyState === 'open') channel.send(encode(msg));
     },
     close(): void {
       closed = true;
-      safeClose(channel, pc, signal);
+      try {
+        channel?.close();
+      } catch {
+        /* already closing */
+      }
+      try {
+        pc.close();
+      } catch {
+        /* already closing */
+      }
+      signal.close();
     },
   };
 }
