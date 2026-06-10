@@ -20,6 +20,8 @@ import {
   keyDown,
   keyWentDown,
   LEFT,
+  mouseClickedIn,
+  mouseOver,
   playSound,
   randomNumber,
   rect,
@@ -29,14 +31,20 @@ import {
   text,
   textAlign,
   textSize,
-  mouseClickedIn,
-  mouseOver,
 } from './gamelab';
-
-export function render_buttons(pos_x:number, pos_y:number, scale_x:number, scale_y:number,before_color, after_color,
-                               text:string, text_size:number) {
-
-}
+import {
+  type BlockSnap,
+  type GuestSession,
+  type HostSession,
+  hostSession,
+  joinSession,
+  makeRoomCode,
+  type Phase,
+  type PlayerInput,
+  roomFromUrl,
+  type Snapshot,
+  shareLink,
+} from './net';
 
 // Persistent sprites — created once in init().
 let backGround!: Sprite;
@@ -55,6 +63,28 @@ let winCon = 25;
 // PARITY: 1 = single-player, 3 = two-player. The value 2 is intentionally
 // unused in the original; restart and damage logic check `players > 2`.
 let players = 1;
+
+// --- Online co-op (host-authoritative; transport in src/net) ----------------
+// netRole selects how draw() behaves: 'local' is the original same-keyboard
+// game; 'host' runs the one authoritative simulation and broadcasts snapshots;
+// 'guest' renders received snapshots and sends only its own input upstream.
+type NetRole = 'local' | 'host' | 'guest';
+type NetStatus = 'idle' | 'waiting' | 'connecting' | 'connected' | 'disconnected';
+let netRole: NetRole = 'local';
+let netStatus: NetStatus = 'idle';
+let roomCode = '';
+let host: HostSession | null = null;
+let guest: GuestSession | null = null;
+// Host side: the guest's latest held controls, plus its previous `up` so the
+// host can derive a jump edge from held state (robust to dropped packets).
+let latestRemoteInput: PlayerInput = { up: false, left: false, right: false };
+let prevRemoteUp = false;
+// Guest side: the latest authoritative frame + a local block render pool.
+let latestSnapshot: Snapshot | null = null;
+let guestBlocks: Sprite[] = [];
+// Host side: each enemy block's animation index, so a snapshot can tell the
+// guest which sprite to draw. WeakMap so destroyed blocks drop out for free.
+const blockAnimIndex = new WeakMap<Sprite, number>();
 
 const shipAnimations: string[] = [];
 for (let i = 1; i <= 21; i++) {
@@ -90,7 +120,6 @@ const ALPHA_PEAK_INITIAL = 0.5;
 const ALPHA_PEAK_FINAL = 1.0;
 const GAUSSIAN_RADIUS_SIGMAS = 3; // outer gradient radius in σ units (~99.7%)
 
-
 // Mouse hit-rects for menu items. Coords are logical canvas pixels (400×400).
 const TITLE_1P_RECT = { x: 60, y: 345, w: 290, h: 25 };
 const TITLE_2P_RECT = { x: 40, y: 365, w: 320, h: 25 };
@@ -98,6 +127,10 @@ const DIFF_EASY_RECT = { x: 90, y: 135, w: 200, h: 30 };
 const DIFF_NORMAL_RECT = { x: 90, y: 185, w: 230, h: 30 };
 const DIFF_HARD_RECT = { x: 90, y: 235, w: 200, h: 30 };
 const HOVER_BG = 'rgba(255, 255, 255, 0.12)';
+
+// Title "host online" entry + lobby copy-button hit-rects (logical 400×400 px).
+const TITLE_HOST_RECT = { x: 40, y: 385, w: 340, h: 22 };
+const COPY_RECT = { x: 80, y: 215, w: 240, h: 28 };
 
 export function init(): void {
   backGround = createSprite(200, 200, 400, 400);
@@ -114,13 +147,34 @@ export function init(): void {
   // Music. The audio shim queues this until the first user gesture unlocks
   // the AudioContext (Chromium autoplay policy).
   playSound('sound://category_music/clear_evidence_loop1.mp3', true);
+
+  // If this page was opened from a host's share link, jump straight into
+  // joining as the guest — the title/menu never shows for player two.
+  const joinCode = roomFromUrl();
+  if (joinCode) startJoining(joinCode);
 }
 
 export function draw(): void {
+  // Guest renders whatever the host last sent; it never simulates.
+  if (netRole === 'guest') {
+    drawGuest();
+    return;
+  }
+  // Host shows the lobby until a guest connects, then falls through to the
+  // normal local flow below and additionally broadcasts a snapshot each tick.
+  if (netRole === 'host' && netStatus !== 'connected') {
+    drawHostLobby();
+    return;
+  }
+
   if (health > 0 && points < winCon && difficulty > 0) {
     drawGameplay();
   } else {
     drawNonGameplay();
+  }
+
+  if (netRole === 'host') {
+    host?.sendSnapshot(buildSnapshot());
   }
 }
 
@@ -134,15 +188,26 @@ function drawGameplay(): void {
   UFO1.setAnimation('ufo_1');
   UFO2.setAnimation('ufo_2');
 
+  // UFO1 is always this machine's arrow keys.
   if (keyWentDown('up')) UFO1.velocityY = -12;
-  if (keyWentDown('w')) UFO2.velocityY = -12;
-
   UFO1.velocityX = 0;
-  UFO2.velocityX = 0;
   if (keyDown('left')) UFO1.velocityX = -5;
   if (keyDown('right')) UFO1.velocityX = 5;
-  if (keyDown('a')) UFO2.velocityX = -5;
-  if (keyDown('d')) UFO2.velocityX = 5;
+
+  // UFO2 is player two: WASD on the same keyboard locally, or the guest's
+  // networked input when hosting (jump edge derived from the held `up`).
+  UFO2.velocityX = 0;
+  if (netRole === 'host') {
+    const remote = latestRemoteInput;
+    if (remote.up && !prevRemoteUp) UFO2.velocityY = -12;
+    prevRemoteUp = remote.up;
+    if (remote.left) UFO2.velocityX = -5;
+    if (remote.right) UFO2.velocityX = 5;
+  } else {
+    if (keyWentDown('w')) UFO2.velocityY = -12;
+    if (keyDown('a')) UFO2.velocityX = -5;
+    if (keyDown('d')) UFO2.velocityX = 5;
+  }
 
   UFO2.velocityY += 1.5;
   UFO1.velocityY += 1.5;
@@ -256,6 +321,8 @@ function spawnBlock(): void {
   const randomIndex = randomNumber(0, shipAnimations.length - 1);
   const name = shipAnimations[randomIndex];
   if (name) newBlock.setAnimation(name);
+  // Remember which sprite this is so host snapshots can name it for the guest.
+  blockAnimIndex.set(newBlock, randomIndex);
   blocks.push(newBlock);
 
   decideNextSpawn();
@@ -402,8 +469,7 @@ function drawDifficultySelect(): void {
   fill('green');
   text('press 1 for easy', 100, 150);
 
-  if (mouseOver(DIFF_NORMAL_RECT.x, DIFF_NORMAL_RECT.y, DIFF_NORMAL_RECT.w, DIFF_NORMAL_RECT.h))
-  {
+  if (mouseOver(DIFF_NORMAL_RECT.x, DIFF_NORMAL_RECT.y, DIFF_NORMAL_RECT.w, DIFF_NORMAL_RECT.h)) {
     fill(HOVER_BG);
     rect(DIFF_NORMAL_RECT.x, DIFF_NORMAL_RECT.y, DIFF_NORMAL_RECT.w, DIFF_NORMAL_RECT.h);
   }
@@ -430,14 +496,14 @@ function drawDifficultySelect(): void {
   if (mouseClickedIn(DIFF_EASY_RECT.x, DIFF_EASY_RECT.y, DIFF_EASY_RECT.w, DIFF_EASY_RECT.h)) {
     difficulty = 1;
   }
-  if (mouseClickedIn(DIFF_NORMAL_RECT.x, DIFF_NORMAL_RECT.y, DIFF_NORMAL_RECT.w,
-      DIFF_NORMAL_RECT.h)) {
+  if (
+    mouseClickedIn(DIFF_NORMAL_RECT.x, DIFF_NORMAL_RECT.y, DIFF_NORMAL_RECT.w, DIFF_NORMAL_RECT.h)
+  ) {
     difficulty = 2;
   }
   if (mouseClickedIn(DIFF_HARD_RECT.x, DIFF_HARD_RECT.y, DIFF_HARD_RECT.w, DIFF_HARD_RECT.h)) {
     difficulty = 3;
   }
-
 }
 
 function drawTitle(): void {
@@ -487,9 +553,21 @@ function drawTitle(): void {
     rect(TITLE_1P_RECT.x, TITLE_1P_RECT.y, TITLE_1P_RECT.w, TITLE_1P_RECT.h);
   }
   fill('orange');
-
   text('Press SPACE for one player', 70, 350);
+
+  if (mouseOver(TITLE_2P_RECT.x, TITLE_2P_RECT.y, TITLE_2P_RECT.w, TITLE_2P_RECT.h)) {
+    fill(HOVER_BG);
+    rect(TITLE_2P_RECT.x, TITLE_2P_RECT.y, TITLE_2P_RECT.w, TITLE_2P_RECT.h);
+  }
+  fill('orange');
   text('Press BACKSPACE for two player!', 50, 370);
+
+  if (mouseOver(TITLE_HOST_RECT.x, TITLE_HOST_RECT.y, TITLE_HOST_RECT.w, TITLE_HOST_RECT.h)) {
+    fill(HOVER_BG);
+    rect(TITLE_HOST_RECT.x, TITLE_HOST_RECT.y, TITLE_HOST_RECT.w, TITLE_HOST_RECT.h);
+  }
+  fill('aqua');
+  text('Press O to host online co-op', 50, 391);
 
   // Capture locals after lazy-init so TS narrowing survives across the
   // remaining draw/destroy calls.
@@ -505,53 +583,38 @@ function drawTitle(): void {
   // PARITY: original calls drawSprite(this.healthIcon) but healthIcon is never
   // created, so the call does nothing in code.org. Omitted here.
 
-  if (keyWentDown('space')) {
+  // Title actions share one icon teardown so keyboard and mouse can't drift.
+  const leaveTitle = (): void => {
     ufo1Ico.destroy();
     ufo2Ico.destroy();
     coinIco.destroy();
     enemyIco.destroy();
     UFOIcon = UFO2Icon = coinIcon = enemyIcon = null;
-    difficulty = -1;
-  }
-  if (keyWentDown('backspace')) {
-    ufo1Ico.destroy();
-    ufo2Ico.destroy();
-    coinIco.destroy();
-    enemyIco.destroy();
-    UFOIcon = UFO2Icon = coinIcon = enemyIcon = null;
-    difficulty = -1;
+  };
+  const startGame = (twoPlayer: boolean): void => {
+    leaveTitle();
     // PARITY: 2P mode is encoded as players === 3 (skipping 2 entirely).
-    players = 3;
-  }
-/*
+    if (twoPlayer) players = 3;
+    difficulty = -1;
+  };
+  const startOnline = (): void => {
+    leaveTitle();
+    startHosting();
+  };
 
-  Wrap up drawTitle — refactor the existing key handlers into a shared startGame(twoPlayer)
-  closure inside the function so the click branch can reuse it:
-
-      const startGame = (twoPlayer: boolean): void => {
-        ufo1Ico.destroy();
-        ufo2Ico.destroy();
-        coinIco.destroy();
-        enemyIco.destroy();
-        UFOIcon = UFO2Icon = coinIcon = enemyIcon = null;
-        if (twoPlayer) players = 3; // PARITY: 2P encoded as 3.
-        difficulty = -1;
-      };
-
-  if (keyWentDown('space')) startGame(false);
-  if (keyWentDown('backspace')) startGame(true);
-  if (mouseClickedIn(TITLE_1P_RECT.x, TITLE_1P_RECT.y, TITLE_1P_RECT.w, TITLE_1P_RECT.h)) {
-    startGame(false);
-  }
-  if (mouseClickedIn(TITLE_2P_RECT.x, TITLE_2P_RECT.y, TITLE_2P_RECT.w, TITLE_2P_RECT.h)) {
-    startGame(true);
-  }
-
-  (Cross-check against the existing code where players = 3 is currently set in the
-  keyWentDown('backspace') branch — preserve any details like that.)
-  */
+  const want1P =
+    keyWentDown('space') ||
+    mouseClickedIn(TITLE_1P_RECT.x, TITLE_1P_RECT.y, TITLE_1P_RECT.w, TITLE_1P_RECT.h);
+  const want2P =
+    keyWentDown('backspace') ||
+    mouseClickedIn(TITLE_2P_RECT.x, TITLE_2P_RECT.y, TITLE_2P_RECT.w, TITLE_2P_RECT.h);
+  const wantOnline =
+    keyWentDown('o') ||
+    mouseClickedIn(TITLE_HOST_RECT.x, TITLE_HOST_RECT.y, TITLE_HOST_RECT.w, TITLE_HOST_RECT.h);
+  if (want1P) startGame(false);
+  else if (want2P) startGame(true);
+  else if (wantOnline) startOnline();
 }
-
 
 function handleDamage(): void {
   health--;
@@ -566,4 +629,279 @@ function handleDamage(): void {
   background(rgb(255, 0, 0, 0.5));
   for (const b of blocks) b.destroy();
   blocks = [];
+}
+
+// --- Online co-op ----------------------------------------------------------
+
+function startHosting(): void {
+  netRole = 'host';
+  netStatus = 'waiting';
+  roomCode = makeRoomCode();
+  players = 3; // two ships active
+  difficulty = -1; // once a guest connects, the host lands on difficulty select
+  host = hostSession(roomCode, {
+    onPeerInput: (input) => {
+      latestRemoteInput = input;
+    },
+    onConnected: () => {
+      netStatus = 'connected';
+    },
+    onDisconnected: () => {
+      netStatus = 'disconnected';
+    },
+  });
+}
+
+function startJoining(code: string): void {
+  netRole = 'guest';
+  netStatus = 'connecting';
+  roomCode = code;
+  players = 3;
+  guest = joinSession(code, {
+    onSnapshot: (snap) => {
+      latestSnapshot = snap;
+      if (netStatus !== 'connected') netStatus = 'connected';
+    },
+    onConnected: () => {
+      netStatus = 'connected';
+    },
+    onDisconnected: () => {
+      netStatus = 'disconnected';
+    },
+  });
+}
+
+function resetToLocalTitle(): void {
+  host?.close();
+  guest?.close();
+  host = null;
+  guest = null;
+  netRole = 'local';
+  netStatus = 'idle';
+  roomCode = '';
+  latestSnapshot = null;
+  latestRemoteInput = { up: false, left: false, right: false };
+  prevRemoteUp = false;
+  for (const b of guestBlocks) b.destroy();
+  guestBlocks = [];
+  for (const b of blocks) b.destroy();
+  blocks = [];
+  players = 1;
+  health = 10;
+  points = 0;
+  winCon = 25;
+  count = 0;
+  coinExists = false;
+  nextSpawn = null;
+  difficulty = -2;
+}
+
+function hostPhase(): Phase {
+  if (health === 0) return 'over';
+  if (points >= winCon) return 'win';
+  if (difficulty > 0) return 'play';
+  return 'wait';
+}
+
+function buildSnapshot(): Snapshot {
+  const snapBlocks: BlockSnap[] = [];
+  for (const b of blocks) {
+    snapBlocks.push({ x: Math.round(b.x), y: Math.round(b.y), anim: blockAnimIndex.get(b) ?? 0 });
+  }
+  return {
+    phase: hostPhase(),
+    ufo1: { x: Math.round(UFO1.x), y: Math.round(UFO1.y) },
+    ufo2: { x: Math.round(UFO2.x), y: Math.round(UFO2.y) },
+    coin: { x: Math.round(coin.x), y: Math.round(coin.y), shown: coinExists },
+    blocks: snapBlocks,
+    health,
+    points,
+    winCon,
+    difficulty,
+    count,
+    spawn: nextSpawn ? { dir: nextSpawn.direction, x: nextSpawn.x, y: nextSpawn.y } : null,
+  };
+}
+
+function copyLink(link: string): void {
+  try {
+    void navigator.clipboard?.writeText(link);
+  } catch {
+    // Clipboard API blocked/unavailable — the link text is shown for manual copy.
+  }
+}
+
+function drawHostLobby(): void {
+  background('black');
+  textAlign(CENTER, CENTER);
+  fill('white');
+  textSize(30);
+  text('Online co-op', 200, 50);
+
+  if (netStatus === 'disconnected') {
+    fill('red');
+    textSize(22);
+    text('Player 2 disconnected.', 200, 180);
+    fill('white');
+    textSize(16);
+    text('Press R to return to the menu', 200, 220);
+    if (keyWentDown('r')) resetToLocalTitle();
+    return;
+  }
+
+  fill('yellow');
+  textSize(24);
+  text(`Room code: ${roomCode}`, 200, 110);
+
+  fill('white');
+  textSize(14);
+  text('Share this link with player 2:', 200, 160);
+  fill('aqua');
+  textSize(11);
+  const link = shareLink(roomCode);
+  text(link, 200, 184);
+
+  fill(
+    mouseOver(COPY_RECT.x, COPY_RECT.y, COPY_RECT.w, COPY_RECT.h)
+      ? HOVER_BG
+      : 'rgba(255,255,255,0.06)',
+  );
+  rect(COPY_RECT.x, COPY_RECT.y, COPY_RECT.w, COPY_RECT.h);
+  fill('white');
+  textSize(16);
+  text('Click to copy link', 200, COPY_RECT.y + COPY_RECT.h / 2);
+  if (mouseClickedIn(COPY_RECT.x, COPY_RECT.y, COPY_RECT.w, COPY_RECT.h)) copyLink(link);
+
+  fill('lightgray');
+  textSize(17);
+  text('Waiting for player 2 to join…', 200, 300);
+  fill('gray');
+  textSize(13);
+  text('Press R to cancel', 200, 340);
+  if (keyWentDown('r')) resetToLocalTitle();
+}
+
+function drawCenterMessage(message: string, sub?: string): void {
+  background('black');
+  textAlign(CENTER, CENTER);
+  fill('white');
+  textSize(26);
+  text(message, 200, 190);
+  if (sub) {
+    fill('gray');
+    textSize(15);
+    text(sub, 200, 230);
+  }
+}
+
+function drawGuest(): void {
+  // Send our held controls upstream every tick; the host derives jump edges.
+  guest?.sendInput({ up: keyDown('up'), left: keyDown('left'), right: keyDown('right') });
+
+  if (netStatus === 'disconnected') {
+    drawCenterMessage('Disconnected from host.', 'Press R to leave');
+    if (keyWentDown('r')) resetToLocalTitle();
+    return;
+  }
+
+  const snap = latestSnapshot;
+  if (!snap) {
+    drawCenterMessage('Connecting to host…', `Room ${roomCode}`);
+    return;
+  }
+  renderSnapshot(snap);
+}
+
+function renderSnapshot(s: Snapshot): void {
+  if (s.phase === 'play') {
+    renderSnapshotPlay(s);
+    return;
+  }
+  if (s.phase === 'over') {
+    background('black');
+    fill('red');
+    textSize(70);
+    textAlign(CENTER, CENTER);
+    text('Game Over!', 200, 150);
+    fill('white');
+    textSize(20);
+    text(`Score: ${s.points}`, 200, 250);
+    text('Waiting for host…', 200, 300);
+    return;
+  }
+  if (s.phase === 'win') {
+    background('black');
+    fill('green');
+    textSize(70);
+    textAlign(CENTER, CENTER);
+    text('You Win!', 200, 150);
+    fill('white');
+    textSize(20);
+    text(`Final Health: ${s.health}`, 200, 250);
+    text('Waiting for host…', 200, 300);
+    return;
+  }
+  drawCenterMessage('Waiting for host to start…', `Room ${roomCode}`);
+}
+
+function renderSnapshotPlay(s: Snapshot): void {
+  // Mirror the host state the shared spawn indicator + HUD read from.
+  count = s.count;
+  difficulty = s.difficulty;
+  nextSpawn = s.spawn ? { direction: s.spawn.dir, x: s.spawn.x, y: s.spawn.y } : null;
+
+  backGround.setAnimation('space_1');
+  UFO1.setAnimation('ufo_1');
+  UFO1.x = s.ufo1.x;
+  UFO1.y = s.ufo1.y;
+  UFO2.setAnimation('ufo_2');
+  UFO2.x = s.ufo2.x;
+  UFO2.y = s.ufo2.y;
+
+  coin.setAnimation('coin');
+  coin.scale = 0.4;
+  coin.x = s.coin.x;
+  coin.y = s.coin.y;
+
+  syncGuestBlocks(s.blocks);
+
+  drawSprite(backGround);
+  drawSpawnIndicator();
+  drawSprite(UFO1);
+  drawSprite(UFO2);
+  drawSprite(coin);
+  for (const b of guestBlocks) drawSprite(b);
+
+  textAlign(LEFT, CENTER);
+  textSize(20);
+  fill('red');
+  text(`Health: ${s.health}`, 300, 20);
+  fill('green');
+  text(`Points: ${s.points}`, 300, 50);
+}
+
+// Reconcile the guest's block sprite pool to the snapshot. The pool only grows;
+// surplus sprites are parked off-screen rather than destroyed, because the guest
+// never calls drawSprites() (which is what reaps destroyed sprites), so churning
+// destroy()/createSprite() here would leak into the global registry.
+function syncGuestBlocks(snapBlocks: BlockSnap[]): void {
+  while (guestBlocks.length < snapBlocks.length) {
+    const sprite = createSprite(0, 0);
+    sprite.scale = 0.2;
+    guestBlocks.push(sprite);
+  }
+  for (let i = 0; i < guestBlocks.length; i++) {
+    const sprite = guestBlocks[i];
+    if (!sprite) continue;
+    const snap = i < snapBlocks.length ? snapBlocks[i] : undefined;
+    if (!snap) {
+      sprite.x = -9999;
+      sprite.y = -9999;
+      continue;
+    }
+    sprite.x = snap.x;
+    sprite.y = snap.y;
+    const name = shipAnimations[snap.anim];
+    if (name) sprite.setAnimation(name);
+  }
 }

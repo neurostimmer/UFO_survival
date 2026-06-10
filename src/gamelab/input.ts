@@ -26,7 +26,7 @@ let currentMouseX = 0;
 let currentMouseY = 0;
 let currentMousePressed = false;
 let previousMousePressed = false;
-let canvasEl : HTMLCanvasElement | null = null;
+let canvasEl: HTMLCanvasElement | null = null;
 
 function updateMousePos(e: PointerEvent): void {
   if (!canvasEl) return;
@@ -61,8 +61,6 @@ export function attachMouse(canvas: HTMLCanvasElement): void {
   canvas.addEventListener('pointerup', onPointerUp as EventListener);
   canvas.addEventListener('pointerdown', onPointerDown as EventListener);
 }
-
-
 
 function normalize(key: string): string {
   if (key === ' ' || key === 'Spacebar') return 'space';
@@ -132,7 +130,7 @@ export function mouseY(): number {
 }
 
 export function mouseDown(): boolean {
-  return currentMousePressed && !previousMousePressed;
+  return currentMousePressed;
 }
 
 export function mouseWentDown(): boolean {
@@ -140,20 +138,12 @@ export function mouseWentDown(): boolean {
 }
 
 export function mouseOver(x: number, y: number, w: number, h: number): boolean {
-  return (
-      currentMouseX >= x &&
-      currentMouseX < x + w &&
-      currentMouseY >= y &&
-      currentMouseY < y + h
-  );
+  return currentMouseX >= x && currentMouseX < x + w && currentMouseY >= y && currentMouseY < y + h;
 }
 
 export function mouseClickedIn(x: number, y: number, w: number, h: number): boolean {
   return mouseWentDown() && mouseOver(x, y, w, h);
 }
-
-
-
 
 // Test-only seam.
 export function _resetForTest(): void {

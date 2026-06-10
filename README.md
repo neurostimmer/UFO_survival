@@ -49,6 +49,9 @@ The split is deliberate: `src/gamelab/` is the rebuildable seam. Swapping the re
 | `npm run test:watch` | Vitest watch mode |
 | `npm run sync-assets` | Re-copy `assets/` → `public/assets/` after sprite changes |
 | `npm run check-sprites` | Python audit script for sprite transparency |
+| `npm run cf:dev` | `wrangler dev` — serve the built `dist/` + signaling Worker locally |
+| `npm run cf:deploy` | Build + `wrangler deploy` to the Cloudflare Worker (online-co-op host) |
+| `npm run typecheck:worker` | Typecheck the Worker + Durable Object under `worker/` |
 
 Node 24 is the supported runtime. CI uses `npm ci` against the committed `package-lock.json`; do the same locally if you hit lockfile drift.
 
@@ -77,6 +80,14 @@ To run the workflow manually (e.g., to redeploy without a code change): Actions 
 | Player 2 | BACKSPACE = 2P | | WASD, W to jump |
 
 `R` restarts from the difficulty screen. `C` on the win screen extends the goal by 25 and grants +1 health.
+
+## Online co-op
+
+On the title screen press **O** (or click "host online co-op") to host a game. You'll get a room code and a shareable link — send the link to a friend. When they open it, they join as player 2 over a direct **peer-to-peer WebRTC** connection. Both players use the arrow keys on their own machine.
+
+The netcode is **host-authoritative**: player 1 runs the single authoritative simulation and broadcasts a state snapshot every tick; player 2 sends only its input and renders what it's told. If the host leaves, the session ends.
+
+Connections are brokered by a Cloudflare Worker + Durable Object (`worker/`) that does WebRTC signaling only — once the peers are connected, gameplay traffic never touches the server. The signaling backend lives at the **same origin** as the game, so online co-op requires the app to be served from the Worker (`npm run cf:deploy`, or `npm run cf:dev` locally) rather than from GitHub Pages. ICE uses public STUN with no TURN, so a pair behind two symmetric NATs may fail to connect.
 
 ## Security
 
