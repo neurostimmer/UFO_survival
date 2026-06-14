@@ -17,6 +17,18 @@ const samples: NetMessage[] = [
   { t: 'coin', x: 80, y: 90, points: 7 },
   { t: 'damage', health: 4 },
   { t: 'wait' },
+  {
+    t: 'diag',
+    tick: 90,
+    spawns: 6,
+    sigN: 6,
+    sigDir: 2,
+    sigSprite: 14,
+    coinX: 110,
+    coinY: 280,
+    points: 5,
+    health: 9,
+  },
 ];
 
 describe('protocol: round-trip', () => {
@@ -48,6 +60,7 @@ describe('protocol: decode rejects malformed frames', () => {
     expect(
       decode(JSON.stringify({ t: 'start', seed: 1, difficulty: 1, health: 1, points: 1 })),
     ).toBeNull();
+    expect(decode(JSON.stringify({ t: 'diag', tick: 1, spawns: 2 }))).toBeNull();
   });
 
   it('returns null on a non-finite number (NaN serializes to JSON null)', () => {
