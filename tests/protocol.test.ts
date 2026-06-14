@@ -13,7 +13,7 @@ const samples: NetMessage[] = [
     coinX: 120,
     coinY: 300,
   },
-  { t: 'pos', x: 150, y: 275 },
+  { t: 'pos', x: 150, y: 275, vx: -5, vy: 3.5 },
   { t: 'coin', x: 80, y: 90, points: 7 },
   { t: 'damage', health: 4 },
   { t: 'wait' },
@@ -54,7 +54,8 @@ describe('protocol: decode rejects malformed frames', () => {
 
   it('returns null when a required field is missing or the wrong type', () => {
     expect(decode(JSON.stringify({ t: 'pos', x: 1 }))).toBeNull();
-    expect(decode(JSON.stringify({ t: 'pos', x: '1', y: 2 }))).toBeNull();
+    expect(decode(JSON.stringify({ t: 'pos', x: 1, y: 2 }))).toBeNull(); // vx/vy required
+    expect(decode(JSON.stringify({ t: 'pos', x: '1', y: 2, vx: 0, vy: 0 }))).toBeNull();
     expect(decode(JSON.stringify({ t: 'damage' }))).toBeNull();
     expect(decode(JSON.stringify({ t: 'coin', x: 1, y: 2 }))).toBeNull();
     expect(
@@ -64,7 +65,7 @@ describe('protocol: decode rejects malformed frames', () => {
   });
 
   it('returns null on a non-finite number (NaN serializes to JSON null)', () => {
-    expect(decode(JSON.stringify({ t: 'pos', x: Number.NaN, y: 0 }))).toBeNull();
+    expect(decode(JSON.stringify({ t: 'pos', x: Number.NaN, y: 0, vx: 0, vy: 0 }))).toBeNull();
   });
 });
 
