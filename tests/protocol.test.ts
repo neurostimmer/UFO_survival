@@ -1,107 +1,81 @@
 import { describe, expect, it } from 'vitest';
-import { decode, encodeInput, encodeSnapshot, type PlayerInput, type Snapshot } from '../src/net';
+import { randomNumber, setRandomSeed } from '../src/gamelab';
+import { decode, encode, type NetMessage } from '../src/net';
 
-const sampleInput: PlayerInput = { up: true, left: false, right: true };
+const samples: NetMessage[] = [
+  {
+    t: 'start',
+    seed: 12345,
+    difficulty: 2,
+    health: 10,
+    points: 0,
+    winCon: 25,
+    coinX: 120,
+    coinY: 300,
+  },
+  { t: 'pos', x: 150, y: 275 },
+  { t: 'coin', x: 80, y: 90, points: 7 },
+  { t: 'damage', health: 4 },
+  { t: 'wait' },
+];
 
-const sampleSnapshot: Snapshot = {
-  phase: 'play',
-  ufo1: { x: 100, y: 200 },
-  ufo2: { x: 250, y: 80 },
-  coin: { x: 150, y: 150, shown: true },
-  blocks: [
-    { x: 410, y: 120, anim: 3 },
-    { x: -10, y: 300, anim: 17 },
-  ],
-  health: 9,
-  points: 4,
-  winCon: 25,
-  difficulty: 2,
-  count: 31,
-  spawn: { dir: 1, x: 410, y: 120 },
-};
-
-describe('protocol: input round-trip', () => {
-  it('encodes and decodes a PlayerInput losslessly', () => {
-    const decoded = decode(encodeInput(sampleInput));
-    expect(decoded).toEqual({ t: 'input', i: sampleInput });
-  });
-
-  it('preserves every button combination', () => {
-    for (let bits = 0; bits < 8; bits++) {
-      const input: PlayerInput = {
-        up: Boolean(bits & 1),
-        left: Boolean(bits & 2),
-        right: Boolean(bits & 4),
-      };
-      expect(decode(encodeInput(input))).toEqual({ t: 'input', i: input });
+describe('protocol: round-trip', () => {
+  it('encodes and decodes every message type losslessly', () => {
+    for (const msg of samples) {
+      expect(decode(encode(msg))).toEqual(msg);
     }
   });
 });
 
-describe('protocol: snapshot round-trip', () => {
-  it('encodes and decodes a full Snapshot losslessly', () => {
-    const decoded = decode(encodeSnapshot(sampleSnapshot));
-    expect(decoded).toEqual({ t: 'snap', s: sampleSnapshot });
-  });
-
-  it('carries a null spawn (the between-cadence state)', () => {
-    const snap: Snapshot = { ...sampleSnapshot, spawn: null, blocks: [] };
-    const decoded = decode(encodeSnapshot(snap));
-    expect(decoded).toEqual({ t: 'snap', s: snap });
-  });
-
-  it('round-trips each phase value', () => {
-    for (const phase of ['play', 'win', 'over', 'wait'] as const) {
-      const snap: Snapshot = { ...sampleSnapshot, phase };
-      const decoded = decode(encodeSnapshot(snap));
-      expect(decoded?.t === 'snap' && decoded.s.phase).toBe(phase);
-    }
-  });
-});
-
-describe('protocol: decode rejects malformed input', () => {
-  it('returns null on non-JSON', () => {
+describe('protocol: decode rejects malformed frames', () => {
+  it('returns null on non-JSON or a primitive', () => {
     expect(decode('not json{')).toBeNull();
     expect(decode('')).toBeNull();
-  });
-
-  it('returns null on a JSON primitive or unknown tag', () => {
     expect(decode('42')).toBeNull();
     expect(decode('null')).toBeNull();
+  });
+
+  it('returns null on an unknown tag', () => {
     expect(decode(JSON.stringify({ t: 'bogus' }))).toBeNull();
+    expect(decode(JSON.stringify({ t: 'snap' }))).toBeNull();
   });
 
-  it('returns null when input fields are the wrong type', () => {
+  it('returns null when a required field is missing or the wrong type', () => {
+    expect(decode(JSON.stringify({ t: 'pos', x: 1 }))).toBeNull();
+    expect(decode(JSON.stringify({ t: 'pos', x: '1', y: 2 }))).toBeNull();
+    expect(decode(JSON.stringify({ t: 'damage' }))).toBeNull();
+    expect(decode(JSON.stringify({ t: 'coin', x: 1, y: 2 }))).toBeNull();
     expect(
-      decode(JSON.stringify({ t: 'input', i: { up: 1, left: false, right: false } })),
+      decode(JSON.stringify({ t: 'start', seed: 1, difficulty: 1, health: 1, points: 1 })),
     ).toBeNull();
-    expect(decode(JSON.stringify({ t: 'input', i: { up: true } }))).toBeNull();
   });
 
-  it('returns null on an invalid phase', () => {
-    const bad = { ...sampleSnapshot, phase: 'paused' };
-    expect(decode(JSON.stringify({ t: 'snap', s: bad }))).toBeNull();
+  it('returns null on a non-finite number (NaN serializes to JSON null)', () => {
+    expect(decode(JSON.stringify({ t: 'pos', x: Number.NaN, y: 0 }))).toBeNull();
+  });
+});
+
+describe('determinism: a shared seed reproduces the same enemy stream', () => {
+  // Mirrors what spawnBlock/decideNextSpawn draw each spawn: direction, a wall
+  // coordinate, and a sprite index. Two clients seeded identically must produce
+  // identical sequences — that's what lets enemies be generated locally on both
+  // instead of streamed.
+  function spawnSequence(seed: number, draws: number): number[] {
+    setRandomSeed(seed);
+    const out: number[] = [];
+    for (let i = 0; i < draws; i++) {
+      out.push(randomNumber(1, 4)); // direction
+      out.push(randomNumber(10, 390)); // wall coordinate
+      out.push(randomNumber(0, 20)); // sprite index
+    }
+    return out;
+  }
+
+  it('produces identical sequences for the same seed', () => {
+    expect(spawnSequence(98765, 50)).toEqual(spawnSequence(98765, 50));
   });
 
-  it('returns null on an invalid spawn direction', () => {
-    const bad = { ...sampleSnapshot, spawn: { dir: 5, x: 0, y: 0 } };
-    expect(decode(JSON.stringify({ t: 'snap', s: bad }))).toBeNull();
-  });
-
-  it('returns null on a non-finite coordinate', () => {
-    const bad = { ...sampleSnapshot, ufo1: { x: Number.NaN, y: 0 } };
-    // NaN serializes to JSON null, which fails the numeric guard.
-    expect(decode(JSON.stringify({ t: 'snap', s: bad }))).toBeNull();
-  });
-
-  it('returns null when a block entry is malformed', () => {
-    const bad = { ...sampleSnapshot, blocks: [{ x: 1, y: 2 }] };
-    expect(decode(JSON.stringify({ t: 'snap', s: bad }))).toBeNull();
-  });
-
-  it('returns null when blocks exceeds the safety cap', () => {
-    const huge = Array.from({ length: 257 }, () => ({ x: 0, y: 0, anim: 0 }));
-    const bad = { ...sampleSnapshot, blocks: huge };
-    expect(decode(JSON.stringify({ t: 'snap', s: bad }))).toBeNull();
+  it('produces different sequences for different seeds', () => {
+    expect(spawnSequence(1, 50)).not.toEqual(spawnSequence(2, 50));
   });
 });

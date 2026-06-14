@@ -85,7 +85,7 @@ To run the workflow manually (e.g., to redeploy without a code change): Actions 
 
 On the title screen press **O** (or click "host online co-op") to host a game. You'll get a room code and a shareable link — send the link to a friend. When they open it, they join as player 2 over a direct **peer-to-peer WebRTC** connection. Both players use the arrow keys on their own machine.
 
-The netcode is **host-authoritative**: player 1 runs the single authoritative simulation and broadcasts a state snapshot every tick; player 2 sends only its input and renders what it's told. If the host leaves, the session ends.
+The netcode is **deterministic**: both players run the same simulation. Enemies are generated locally from a shared seed (so they never travel over the wire), and each player flies their own ship from local input — so **neither player has input lag**. Only each player's position and a few host-decided events that depend on both ships (coin pickups, damage, restarts) cross the wire. Player 1 is the authority for those shared events; if it leaves, the session ends.
 
 Connections are brokered by a Cloudflare Worker + Durable Object (`worker/`) that does WebRTC signaling only — once the peers are connected, gameplay traffic never touches the server. The signaling backend lives at the **same origin** as the game, so online co-op requires the app to be served from the Worker (`npm run cf:deploy`, or `npm run cf:dev` locally) rather than from GitHub Pages. ICE uses public STUN with no TURN, so a pair behind two symmetric NATs may fail to connect.
 

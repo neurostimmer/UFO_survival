@@ -27,22 +27,19 @@ import {
   rect,
   rgb,
   type Sprite,
+  setRandomSeed,
   TOP,
   text,
   textAlign,
   textSize,
 } from './gamelab';
 import {
-  type BlockSnap,
-  type GuestSession,
-  type HostSession,
   hostSession,
   joinSession,
   makeRoomCode,
-  type Phase,
-  type PlayerInput,
+  type NetMessage,
   roomFromUrl,
-  type Snapshot,
+  type Session,
   shareLink,
 } from './net';
 
@@ -64,27 +61,30 @@ let winCon = 25;
 // unused in the original; restart and damage logic check `players > 2`.
 let players = 1;
 
-// --- Online co-op (host-authoritative; transport in src/net) ----------------
-// netRole selects how draw() behaves: 'local' is the original same-keyboard
-// game; 'host' runs the one authoritative simulation and broadcasts snapshots;
-// 'guest' renders received snapshots and sends only its own input upstream.
+// --- Online co-op (deterministic; transport in src/net) ---------------------
+// netRole selects how draw() behaves. 'local' is the original same-keyboard
+// game. Online, BOTH clients run the same simulation: enemies come from a
+// shared seed, each player runs their OWN ship from local input (zero lag),
+// and only positions + a few host-authoritative events cross the wire.
 type NetRole = 'local' | 'host' | 'guest';
 type NetStatus = 'idle' | 'waiting' | 'connecting' | 'connected' | 'disconnected';
 let netRole: NetRole = 'local';
 let netStatus: NetStatus = 'idle';
 let roomCode = '';
-let host: HostSession | null = null;
-let guest: GuestSession | null = null;
-// Host side: the guest's latest held controls, plus its previous `up` so the
-// host can derive a jump edge from held state (robust to dropped packets).
-let latestRemoteInput: PlayerInput = { up: false, left: false, right: false };
-let prevRemoteUp = false;
-// Guest side: the latest authoritative frame + a local block render pool.
-let latestSnapshot: Snapshot | null = null;
-let guestBlocks: Sprite[] = [];
-// Host side: each enemy block's animation index, so a snapshot can tell the
-// guest which sprite to draw. WeakMap so destroyed blocks drop out for free.
-const blockAnimIndex = new WeakMap<Sprite, number>();
+let session: Session | null = null;
+// The other player's most recent ship position (host sees the guest's, guest
+// sees the host's). Applied directly so the host's collision checks use the
+// real position, not a smoothed one.
+let remoteX = 200;
+let remoteY = 200;
+// Host: whether the current match's `start` has been sent. Guest: whether a
+// `start` has been received (gates the gameplay screen vs the waiting screen).
+let onlineMatchStarted = false;
+let gameStarted = false;
+// Host-only: suppresses repeat damage from a networked off-field ship for a few
+// ticks (the host can't force the remote ship back on-field; the guest's own
+// respawn position only arrives ~½ RTT later).
+let damageCooldown = 0;
 
 const shipAnimations: string[] = [];
 for (let i = 1; i <= 21; i++) {
@@ -155,26 +155,19 @@ export function init(): void {
 }
 
 export function draw(): void {
-  // Guest renders whatever the host last sent; it never simulates.
+  if (netRole === 'host') {
+    drawHost();
+    return;
+  }
   if (netRole === 'guest') {
     drawGuest();
     return;
   }
-  // Host shows the lobby until a guest connects, then falls through to the
-  // normal local flow below and additionally broadcasts a snapshot each tick.
-  if (netRole === 'host' && netStatus !== 'connected') {
-    drawHostLobby();
-    return;
-  }
-
+  // Local same-keyboard play.
   if (health > 0 && points < winCon && difficulty > 0) {
     drawGameplay();
   } else {
     drawNonGameplay();
-  }
-
-  if (netRole === 'host') {
-    host?.sendSnapshot(buildSnapshot());
   }
 }
 
@@ -188,26 +181,15 @@ function drawGameplay(): void {
   UFO1.setAnimation('ufo_1');
   UFO2.setAnimation('ufo_2');
 
-  // UFO1 is always this machine's arrow keys.
   if (keyWentDown('up')) UFO1.velocityY = -12;
+  if (keyWentDown('w')) UFO2.velocityY = -12;
+
   UFO1.velocityX = 0;
+  UFO2.velocityX = 0;
   if (keyDown('left')) UFO1.velocityX = -5;
   if (keyDown('right')) UFO1.velocityX = 5;
-
-  // UFO2 is player two: WASD on the same keyboard locally, or the guest's
-  // networked input when hosting (jump edge derived from the held `up`).
-  UFO2.velocityX = 0;
-  if (netRole === 'host') {
-    const remote = latestRemoteInput;
-    if (remote.up && !prevRemoteUp) UFO2.velocityY = -12;
-    prevRemoteUp = remote.up;
-    if (remote.left) UFO2.velocityX = -5;
-    if (remote.right) UFO2.velocityX = 5;
-  } else {
-    if (keyWentDown('w')) UFO2.velocityY = -12;
-    if (keyDown('a')) UFO2.velocityX = -5;
-    if (keyDown('d')) UFO2.velocityX = 5;
-  }
+  if (keyDown('a')) UFO2.velocityX = -5;
+  if (keyDown('d')) UFO2.velocityX = 5;
 
   UFO2.velocityY += 1.5;
   UFO1.velocityY += 1.5;
@@ -321,8 +303,6 @@ function spawnBlock(): void {
   const randomIndex = randomNumber(0, shipAnimations.length - 1);
   const name = shipAnimations[randomIndex];
   if (name) newBlock.setAnimation(name);
-  // Remember which sprite this is so host snapshots can name it for the guest.
-  blockAnimIndex.set(newBlock, randomIndex);
   blocks.push(newBlock);
 
   decideNextSpawn();
@@ -639,10 +619,9 @@ function startHosting(): void {
   roomCode = makeRoomCode();
   players = 3; // two ships active
   difficulty = -1; // once a guest connects, the host lands on difficulty select
-  host = hostSession(roomCode, {
-    onPeerInput: (input) => {
-      latestRemoteInput = input;
-    },
+  onlineMatchStarted = false;
+  session = hostSession(roomCode, {
+    onMessage: onNetMessage,
     onConnected: () => {
       netStatus = 'connected';
     },
@@ -657,13 +636,11 @@ function startJoining(code: string): void {
   netStatus = 'connecting';
   roomCode = code;
   players = 3;
-  guest = joinSession(code, {
-    onSnapshot: (snap) => {
-      latestSnapshot = snap;
-      if (netStatus !== 'connected') netStatus = 'connected';
-    },
+  gameStarted = false;
+  session = joinSession(code, {
+    onMessage: onNetMessage,
     onConnected: () => {
-      netStatus = 'connected';
+      if (netStatus === 'connecting') netStatus = 'connected';
     },
     onDisconnected: () => {
       netStatus = 'disconnected';
@@ -672,18 +649,14 @@ function startJoining(code: string): void {
 }
 
 function resetToLocalTitle(): void {
-  host?.close();
-  guest?.close();
-  host = null;
-  guest = null;
+  session?.close();
+  session = null;
   netRole = 'local';
   netStatus = 'idle';
   roomCode = '';
-  latestSnapshot = null;
-  latestRemoteInput = { up: false, left: false, right: false };
-  prevRemoteUp = false;
-  for (const b of guestBlocks) b.destroy();
-  guestBlocks = [];
+  onlineMatchStarted = false;
+  gameStarted = false;
+  damageCooldown = 0;
   for (const b of blocks) b.destroy();
   blocks = [];
   players = 1;
@@ -694,33 +667,260 @@ function resetToLocalTitle(): void {
   coinExists = false;
   nextSpawn = null;
   difficulty = -2;
+  setRandomSeed(null); // restore non-deterministic local play
 }
 
-function hostPhase(): Phase {
-  if (health === 0) return 'over';
-  if (points >= winCon) return 'win';
-  if (difficulty > 0) return 'play';
-  return 'wait';
+// The local player's ship: UFO1 when hosting, UFO2 when guest.
+function ownShip(): Sprite {
+  return netRole === 'host' ? UFO1 : UFO2;
 }
 
-function buildSnapshot(): Snapshot {
-  const snapBlocks: BlockSnap[] = [];
-  for (const b of blocks) {
-    snapBlocks.push({ x: Math.round(b.x), y: Math.round(b.y), anim: blockAnimIndex.get(b) ?? 0 });
+function respawnOwnShip(): void {
+  const s = ownShip();
+  s.x = 200;
+  s.y = 200;
+  s.velocityX = 0;
+  s.velocityY = -15;
+}
+
+function offField(s: Sprite): boolean {
+  return s.x < 0 || s.x > 400 || s.y < 0 || s.y > 400;
+}
+
+// Coins are host-authoritative (who grabs one depends on both ships), so the
+// host picks positions from Math.random — NOT the seeded RNG — to keep the
+// shared enemy stream byte-identical on both clients.
+function placeCoin(): void {
+  coin.x = Math.round(50 + Math.random() * 300);
+  coin.y = Math.round(50 + Math.random() * 300);
+  coinExists = true;
+}
+
+// Applies every host→guest event on the guest, plus the per-tick `pos` (which
+// both sides receive). The host only ever receives `pos`.
+function onNetMessage(msg: NetMessage): void {
+  switch (msg.t) {
+    case 'pos':
+      remoteX = msg.x;
+      remoteY = msg.y;
+      break;
+    case 'start':
+      setRandomSeed(msg.seed);
+      difficulty = msg.difficulty;
+      health = msg.health;
+      points = msg.points;
+      winCon = msg.winCon;
+      count = 0;
+      nextSpawn = null;
+      damageCooldown = 0;
+      for (const b of blocks) b.destroy();
+      blocks = [];
+      coin.x = msg.coinX;
+      coin.y = msg.coinY;
+      coinExists = true;
+      gameStarted = true;
+      break;
+    case 'coin':
+      points = msg.points;
+      coin.x = msg.x;
+      coin.y = msg.y;
+      coinExists = true;
+      break;
+    case 'damage':
+      health = msg.health;
+      for (const b of blocks) b.destroy();
+      blocks = [];
+      respawnOwnShip();
+      break;
+    case 'wait':
+      gameStarted = false;
+      break;
   }
-  return {
-    phase: hostPhase(),
-    ufo1: { x: Math.round(UFO1.x), y: Math.round(UFO1.y) },
-    ufo2: { x: Math.round(UFO2.x), y: Math.round(UFO2.y) },
-    coin: { x: Math.round(coin.x), y: Math.round(coin.y), shown: coinExists },
-    blocks: snapBlocks,
+}
+
+// Host: seed and broadcast a (re)start. `fresh` resets score/health for a new
+// match; a win-continue keeps them and just reseeds the enemy wave.
+function startMatchHost(fresh: boolean): void {
+  if (fresh) {
+    health = 10;
+    points = 0;
+    winCon = 25;
+  }
+  const seed = Math.floor(Math.random() * 0x7fffffff);
+  setRandomSeed(seed);
+  count = 0;
+  nextSpawn = null;
+  damageCooldown = 0;
+  for (const b of blocks) b.destroy();
+  blocks = [];
+  placeCoin();
+  onlineMatchStarted = true;
+  session?.send({
+    t: 'start',
+    seed,
+    difficulty,
     health,
     points,
     winCon,
-    difficulty,
-    count,
-    spawn: nextSpawn ? { dir: nextSpawn.direction, x: nextSpawn.x, y: nextSpawn.y } : null,
-  };
+    coinX: Math.round(coin.x),
+    coinY: Math.round(coin.y),
+  });
+}
+
+function drawHost(): void {
+  if (netStatus !== 'connected') {
+    drawHostLobby();
+    return;
+  }
+  const playing = health > 0 && points < winCon && difficulty > 0;
+  if (playing) {
+    if (!onlineMatchStarted) startMatchHost(true);
+    drawGameplayOnline();
+    return;
+  }
+  // Leaving gameplay (to select, or on game over) clears the match flag so the
+  // next entry seeds a fresh world; a win keeps it (the continue reseeds).
+  if (difficulty <= 0 || health === 0) onlineMatchStarted = false;
+  drawOnlineMenus();
+}
+
+// The shared online gameplay tick, run by BOTH clients. The local ship is
+// driven by local input; the remote ship sits at its last received position;
+// enemies advance deterministically from the shared seed. Only the host decides
+// coin/damage events.
+function drawGameplayOnline(): void {
+  const isHost = netRole === 'host';
+  const localShip = isHost ? UFO1 : UFO2;
+  const remoteShip = isHost ? UFO2 : UFO1;
+
+  if (!nextSpawn) decideNextSpawn();
+
+  backGround.setAnimation('space_1');
+  UFO1.setAnimation('ufo_1');
+  UFO2.setAnimation('ufo_2');
+  coin.setAnimation('coin');
+  coin.scale = 0.4;
+
+  // Local ship: live input + physics (zero lag).
+  if (keyWentDown('up')) localShip.velocityY = -12;
+  localShip.velocityX = 0;
+  if (keyDown('left')) localShip.velocityX = -5;
+  if (keyDown('right')) localShip.velocityX = 5;
+  localShip.velocityY += 1.5;
+
+  // Remote ship: placed directly at its last received position (no local
+  // physics) so the host's collision checks see where it really is.
+  remoteShip.velocityX = 0;
+  remoteShip.velocityY = 0;
+  remoteShip.x = remoteX;
+  remoteShip.y = remoteY;
+
+  // Tell the other client where we are.
+  session?.send({ t: 'pos', x: Math.round(localShip.x), y: Math.round(localShip.y) });
+
+  drawSprite(backGround);
+  drawSpawnIndicator();
+  drawSprite(UFO1);
+  drawSprite(UFO2);
+  drawSprite(coin);
+  for (const b of blocks) drawSprite(b);
+
+  textAlign(LEFT, CENTER);
+  textSize(20);
+  fill('red');
+  text(`Health: ${health}`, 300, 20);
+  fill('green');
+  text(`Points: ${points}`, 300, 50);
+
+  // Deterministic enemy spawning + cleanup — identical on both via the seed.
+  count++;
+  if (count === 100 - difficulty * 25) {
+    spawnBlock();
+    count = 0;
+  }
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    const b = blocks[i];
+    if (b && (b.x < -10 || b.x > 410 || b.y < -10 || b.y > 410)) {
+      b.destroy();
+      blocks.splice(i, 1);
+    }
+  }
+
+  if (isHost) hostAuthoritativeEvents(localShip, remoteShip);
+}
+
+// Host only: the events that depend on BOTH ships and so can't be derived
+// independently. Coin pickups and damage are detected here and broadcast.
+function hostAuthoritativeEvents(localShip: Sprite, remoteShip: Sprite): void {
+  if (damageCooldown > 0) damageCooldown--;
+
+  if (coinExists && (localShip.isTouching(coin) || remoteShip.isTouching(coin))) {
+    points++;
+    placeCoin();
+    session?.send({ t: 'coin', x: Math.round(coin.x), y: Math.round(coin.y), points });
+  }
+
+  if (damageCooldown === 0) {
+    let damaged = offField(localShip) || offField(remoteShip);
+    if (!damaged) {
+      for (const b of blocks) {
+        if (b && (localShip.isTouching(b) || remoteShip.isTouching(b))) {
+          damaged = true;
+          break;
+        }
+      }
+    }
+    if (damaged) {
+      health--;
+      for (const b of blocks) b.destroy();
+      blocks = [];
+      respawnOwnShip();
+      damageCooldown = 15; // ~0.5 s; covers the remote ship's respawn round-trip
+      session?.send({ t: 'damage', health });
+    }
+  }
+}
+
+function drawOnlineMenus(): void {
+  if (health === 0) {
+    drawGameOver();
+    if (keyWentDown('r')) hostRestartToSelect();
+  } else if (points >= winCon) {
+    drawWinOnline();
+    if (keyWentDown('C')) hostContinue();
+  } else {
+    // difficulty === -1: host picks, which flips into gameplay next tick.
+    drawDifficultySelect();
+  }
+}
+
+function drawWinOnline(): void {
+  fill('green');
+  textSize(70);
+  textAlign(CENTER, CENTER);
+  text('You Win!', 200, 150);
+  fill('white');
+  textSize(20);
+  text(`Final Health: ${health}`, 200, 250);
+  text('press C to keep going!', 200, 275);
+}
+
+function hostRestartToSelect(): void {
+  health = 10;
+  points = 0;
+  winCon = 25;
+  count = 0;
+  nextSpawn = null;
+  for (const b of blocks) b.destroy();
+  blocks = [];
+  onlineMatchStarted = false;
+  difficulty = -1;
+  session?.send({ t: 'wait' });
+}
+
+function hostContinue(): void {
+  winCon += 25;
+  startMatchHost(false); // keep score/health, reseed a fresh wave, resume
 }
 
 function copyLink(link: string): void {
@@ -795,113 +995,35 @@ function drawCenterMessage(message: string, sub?: string): void {
 }
 
 function drawGuest(): void {
-  // Send our held controls upstream every tick; the host derives jump edges.
-  guest?.sendInput({ up: keyDown('up'), left: keyDown('left'), right: keyDown('right') });
-
   if (netStatus === 'disconnected') {
     drawCenterMessage('Disconnected from host.', 'Press R to leave');
     if (keyWentDown('r')) resetToLocalTitle();
     return;
   }
-
-  const snap = latestSnapshot;
-  if (!snap) {
-    drawCenterMessage('Connecting to host…', `Room ${roomCode}`);
+  if (!gameStarted) {
+    const msg = netStatus === 'connected' ? 'Waiting for host to start…' : 'Connecting to host…';
+    drawCenterMessage(msg, `Room ${roomCode}`);
     return;
   }
-  renderSnapshot(snap);
+  if (health <= 0) {
+    drawGuestOverlay('Game Over!', 'red', `Score: ${points}`);
+    return;
+  }
+  if (points >= winCon) {
+    drawGuestOverlay('You Win!', 'green', `Final Health: ${health}`);
+    return;
+  }
+  drawGameplayOnline();
 }
 
-function renderSnapshot(s: Snapshot): void {
-  if (s.phase === 'play') {
-    renderSnapshotPlay(s);
-    return;
-  }
-  if (s.phase === 'over') {
-    background('black');
-    fill('red');
-    textSize(70);
-    textAlign(CENTER, CENTER);
-    text('Game Over!', 200, 150);
-    fill('white');
-    textSize(20);
-    text(`Score: ${s.points}`, 200, 250);
-    text('Waiting for host…', 200, 300);
-    return;
-  }
-  if (s.phase === 'win') {
-    background('black');
-    fill('green');
-    textSize(70);
-    textAlign(CENTER, CENTER);
-    text('You Win!', 200, 150);
-    fill('white');
-    textSize(20);
-    text(`Final Health: ${s.health}`, 200, 250);
-    text('Waiting for host…', 200, 300);
-    return;
-  }
-  drawCenterMessage('Waiting for host to start…', `Room ${roomCode}`);
-}
-
-function renderSnapshotPlay(s: Snapshot): void {
-  // Mirror the host state the shared spawn indicator + HUD read from.
-  count = s.count;
-  difficulty = s.difficulty;
-  nextSpawn = s.spawn ? { direction: s.spawn.dir, x: s.spawn.x, y: s.spawn.y } : null;
-
-  backGround.setAnimation('space_1');
-  UFO1.setAnimation('ufo_1');
-  UFO1.x = s.ufo1.x;
-  UFO1.y = s.ufo1.y;
-  UFO2.setAnimation('ufo_2');
-  UFO2.x = s.ufo2.x;
-  UFO2.y = s.ufo2.y;
-
-  coin.setAnimation('coin');
-  coin.scale = 0.4;
-  coin.x = s.coin.x;
-  coin.y = s.coin.y;
-
-  syncGuestBlocks(s.blocks);
-
-  drawSprite(backGround);
-  drawSpawnIndicator();
-  drawSprite(UFO1);
-  drawSprite(UFO2);
-  drawSprite(coin);
-  for (const b of guestBlocks) drawSprite(b);
-
-  textAlign(LEFT, CENTER);
+function drawGuestOverlay(title: string, color: string, sub: string): void {
+  background('black');
+  fill(color);
+  textSize(70);
+  textAlign(CENTER, CENTER);
+  text(title, 200, 150);
+  fill('white');
   textSize(20);
-  fill('red');
-  text(`Health: ${s.health}`, 300, 20);
-  fill('green');
-  text(`Points: ${s.points}`, 300, 50);
-}
-
-// Reconcile the guest's block sprite pool to the snapshot. The pool only grows;
-// surplus sprites are parked off-screen rather than destroyed, because the guest
-// never calls drawSprites() (which is what reaps destroyed sprites), so churning
-// destroy()/createSprite() here would leak into the global registry.
-function syncGuestBlocks(snapBlocks: BlockSnap[]): void {
-  while (guestBlocks.length < snapBlocks.length) {
-    const sprite = createSprite(0, 0);
-    sprite.scale = 0.2;
-    guestBlocks.push(sprite);
-  }
-  for (let i = 0; i < guestBlocks.length; i++) {
-    const sprite = guestBlocks[i];
-    if (!sprite) continue;
-    const snap = i < snapBlocks.length ? snapBlocks[i] : undefined;
-    if (!snap) {
-      sprite.x = -9999;
-      sprite.y = -9999;
-      continue;
-    }
-    sprite.x = snap.x;
-    sprite.y = snap.y;
-    const name = shipAnimations[snap.anim];
-    if (name) sprite.setAnimation(name);
-  }
+  text(sub, 200, 250);
+  text('Waiting for host…', 200, 300);
 }
