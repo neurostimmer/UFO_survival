@@ -89,6 +89,15 @@ The netcode is **deterministic**: both players run the same simulation. Enemies 
 
 Connections are brokered by a Cloudflare Worker + Durable Object (`worker/`) that does WebRTC signaling only — once the peers are connected, gameplay traffic never touches the server. The signaling backend lives at the **same origin** as the game, so online co-op requires the app to be served from the Worker (`npm run cf:deploy`, or `npm run cf:dev` locally) rather than from GitHub Pages. ICE uses public STUN with no TURN, so a pair behind two symmetric NATs may fail to connect.
 
+**URL flags (per client, opt-in):**
+
+| Flag | Effect |
+| --- | --- |
+| `?smooth=1` | Smooths the *other* player's ship: dead-reckons it forward by its last sent velocity and eases the drawn position toward that prediction (exponential smoothing), hiding the ½-RTT lag and dropped-packet jitter. Render-only — the host still collides on the raw received position. No flag = the ship snaps to its raw position. |
+| `?debug=1` | On the **host** only: shows a running desync log under the canvas comparing the host's sim against the guest's (piped over the data channel) — enemy-stream seed match, coin match, and tick drift. |
+
+Each flag is read independently per page load, so a host can combine them (`?smooth=1&debug=1`) and a guest can add `&smooth=1` to their `?join=` link.
+
 > **Deploy note (Durable Objects):** deploy the Worker with `wrangler deploy` (what `npm run cf:deploy` runs). `wrangler versions upload` **cannot** apply a Durable Object migration and fails with error 10211 — so if your Cloudflare build pipeline's deploy command is `wrangler versions upload`, change it to `wrangler deploy`, or apply the migration once locally with `npm run cf:deploy`.
 
 ## Security

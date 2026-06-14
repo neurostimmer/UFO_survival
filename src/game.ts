@@ -106,6 +106,30 @@ function resetDiag(): void {
   hostSpawns.length = 0;
 }
 
+// Remote-ship smoothing (?smooth=1, read per-client in init()). Off → the remote
+// ship snaps to its raw received position (current behavior). On → dead-reckon
+// it forward by its last sent velocity and ease the DRAWN position toward that
+// prediction, hiding ½-RTT lag and dropped-packet jitter. Render-only: the host
+// still collides on the raw position. See the netcode notes in CLAUDE.md.
+let remoteSmoothing = false;
+let predX = 200; // dead-reckon anchor: last received pos, advanced each tick
+let predY = 200;
+let predVX = 0; // last received velocity
+let predVY = 0;
+let predStale = 0; // ticks since the last pos update (caps runaway extrapolation)
+let dispX = 200; // smoothed position actually drawn
+let dispY = 200;
+const REMOTE_SMOOTH = 0.5; // exponential-smoothing factor toward the prediction
+const PREDICT_CAP = 10; // stop extrapolating after this many tickless updates (~⅓ s)
+
+// Re-anchor the smoother at a (re)start so it doesn't slide in from a stale spot.
+function resetRemoteSmoothing(): void {
+  predX = dispX = remoteX;
+  predY = dispY = remoteY;
+  predVX = predVY = 0;
+  predStale = 0;
+}
+
 const shipAnimations: string[] = [];
 for (let i = 1; i <= 21; i++) {
   shipAnimations.push(i < 10 ? `retroship_0${i}_1` : `retroship_${i}_1`);
@@ -167,6 +191,9 @@ export function init(): void {
   // Music. The audio shim queues this until the first user gesture unlocks
   // the AudioContext (Chromium autoplay policy).
   playSound('sound://category_music/clear_evidence_loop1.mp3', true);
+
+  // ?smooth=1 opts this client into remote-ship dead-reckoning + smoothing.
+  remoteSmoothing = new URLSearchParams(location.search).get('smooth') === '1';
 
   // If this page was opened from a host's share link, jump straight into
   // joining as the guest — the title/menu never shows for player two.
@@ -688,6 +715,7 @@ function resetToLocalTitle(): void {
   gameStarted = false;
   damageCooldown = 0;
   resetDiag();
+  resetRemoteSmoothing();
   for (const b of blocks) b.destroy();
   blocks = [];
   players = 1;
@@ -734,6 +762,13 @@ function onNetMessage(msg: NetMessage): void {
     case 'pos':
       remoteX = msg.x;
       remoteY = msg.y;
+      // Re-anchor the dead-reckoner on each authoritative sample (used only when
+      // ?smooth=1; harmless otherwise).
+      predX = msg.x;
+      predY = msg.y;
+      predVX = msg.vx;
+      predVY = msg.vy;
+      predStale = 0;
       break;
     case 'start':
       setRandomSeed(msg.seed);
@@ -745,6 +780,7 @@ function onNetMessage(msg: NetMessage): void {
       nextSpawn = null;
       damageCooldown = 0;
       resetDiag();
+      resetRemoteSmoothing();
       for (const b of blocks) b.destroy();
       blocks = [];
       coin.x = msg.coinX;
@@ -820,6 +856,7 @@ function startMatchHost(fresh: boolean): void {
   nextSpawn = null;
   damageCooldown = 0;
   resetDiag();
+  resetRemoteSmoothing();
   for (const b of blocks) b.destroy();
   blocks = [];
   placeCoin();
@@ -878,15 +915,37 @@ function drawGameplayOnline(): void {
   if (keyDown('right')) localShip.velocityX = 5;
   localShip.velocityY += 1.5;
 
-  // Remote ship: placed directly at its last received position (no local
-  // physics) so the host's collision checks see where it really is.
+  // Remote ship: never moved by local physics — we place it explicitly each
+  // tick. With ?smooth=1 we draw a dead-reckoned + smoothed position to hide the
+  // ½-RTT lag; otherwise it snaps to the raw received position (current
+  // behavior). The host re-pins it to the raw position before collision below.
   remoteShip.velocityX = 0;
   remoteShip.velocityY = 0;
-  remoteShip.x = remoteX;
-  remoteShip.y = remoteY;
+  if (remoteSmoothing) {
+    if (predStale < PREDICT_CAP) {
+      predVY += 1.5; // mirror the ship's gravity so the predicted arc stays true
+      predX += predVX;
+      predY += predVY;
+      predStale++;
+    }
+    dispX += (predX - dispX) * REMOTE_SMOOTH;
+    dispY += (predY - dispY) * REMOTE_SMOOTH;
+    remoteShip.x = dispX;
+    remoteShip.y = dispY;
+  } else {
+    remoteShip.x = remoteX;
+    remoteShip.y = remoteY;
+  }
 
-  // Tell the other client where we are.
-  session?.send({ t: 'pos', x: Math.round(localShip.x), y: Math.round(localShip.y) });
+  // Tell the other client where we are, and how we're moving (for their
+  // dead-reckoning). velocityX/Y were just set from this tick's input above.
+  session?.send({
+    t: 'pos',
+    x: Math.round(localShip.x),
+    y: Math.round(localShip.y),
+    vx: localShip.velocityX,
+    vy: localShip.velocityY,
+  });
 
   // Guest pipes a periodic digest back to the host for the desync log (~2/s).
   // Sent unconditionally — the host decides whether to display it (?debug=1).
@@ -933,7 +992,13 @@ function drawGameplayOnline(): void {
     }
   }
 
-  if (isHost) hostAuthoritativeEvents(localShip, remoteShip);
+  // Collision/coin/damage are host-authoritative and must use the RAW received
+  // position, not the smoothed/predicted one (smoothing is render-only).
+  if (isHost) {
+    remoteShip.x = remoteX;
+    remoteShip.y = remoteY;
+    hostAuthoritativeEvents(localShip, remoteShip);
+  }
 }
 
 // Host only: the events that depend on BOTH ships and so can't be derived

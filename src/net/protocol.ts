@@ -25,11 +25,15 @@ export interface StartMsg {
   coinY: number;
 }
 
-// Either direction, every tick: the sender's own ship position.
+// Either direction, every tick: the sender's own ship position and current
+// velocity. Velocity lets the receiver dead-reckon the remote ship forward to
+// hide ½-RTT lag (?smooth=1); it's ignored when smoothing is off.
 export interface PosMsg {
   t: 'pos';
   x: number;
   y: number;
+  vx: number;
+  vy: number;
 }
 
 // Host → guest: a coin was collected (by either ship). Carries the new score
@@ -109,7 +113,9 @@ export function decode(raw: string): NetMessage | null {
           }
         : null;
     case 'pos':
-      return num(v.x) && num(v.y) ? { t: 'pos', x: v.x, y: v.y } : null;
+      return num(v.x) && num(v.y) && num(v.vx) && num(v.vy)
+        ? { t: 'pos', x: v.x, y: v.y, vx: v.vx, vy: v.vy }
+        : null;
     case 'coin':
       return num(v.x) && num(v.y) && num(v.points)
         ? { t: 'coin', x: v.x, y: v.y, points: v.points }
