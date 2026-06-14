@@ -9,6 +9,7 @@
 // Do not "fix" any of them until the port is signed off as visually identical
 // to the code.org page; then queue them as labeled follow-ups.
 
+import { debugEnabled, diagLine } from './diag';
 import {
   background,
   CENTER,
@@ -34,6 +35,7 @@ import {
   textSize,
 } from './gamelab';
 import {
+  type DiagMsg,
   hostSession,
   joinSession,
   makeRoomCode,
@@ -85,6 +87,24 @@ let gameStarted = false;
 // ticks (the host can't force the remote ship back on-field; the guest's own
 // respawn position only arrives ~½ RTT later).
 let damageCooldown = 0;
+
+// Debug diagnostics (online; ?debug=1 on the host). A monotonic per-match frame
+// counter plus the most-recent spawn signature, reset at every (re)start. The
+// guest pipes these to the host; the host also keeps its own spawn signatures by
+// ordinal (hostSpawns) to compare against. See src/diag.ts.
+let netTick = 0;
+let spawnCount = 0;
+let lastSpawnN = -1;
+let lastSpawnDir = 0;
+let lastSpawnSprite = 0;
+const hostSpawns: Array<{ dir: number; sprite: number }> = [];
+
+function resetDiag(): void {
+  netTick = 0;
+  spawnCount = 0;
+  lastSpawnN = -1;
+  hostSpawns.length = 0;
+}
 
 const shipAnimations: string[] = [];
 for (let i = 1; i <= 21; i++) {
@@ -304,6 +324,16 @@ function spawnBlock(): void {
   const name = shipAnimations[randomIndex];
   if (name) newBlock.setAnimation(name);
   blocks.push(newBlock);
+
+  // Record this enemy's seed-derived signature for the online desync log. Both
+  // clients run spawnBlock; only the host reads hostSpawns (keyed by ordinal).
+  if (netRole !== 'local') {
+    spawnCount++;
+    lastSpawnN = spawnCount;
+    lastSpawnDir = target.direction;
+    lastSpawnSprite = randomIndex;
+    hostSpawns[spawnCount] = { dir: target.direction, sprite: randomIndex };
+  }
 
   decideNextSpawn();
 }
@@ -657,6 +687,7 @@ function resetToLocalTitle(): void {
   onlineMatchStarted = false;
   gameStarted = false;
   damageCooldown = 0;
+  resetDiag();
   for (const b of blocks) b.destroy();
   blocks = [];
   players = 1;
@@ -713,6 +744,7 @@ function onNetMessage(msg: NetMessage): void {
       count = 0;
       nextSpawn = null;
       damageCooldown = 0;
+      resetDiag();
       for (const b of blocks) b.destroy();
       blocks = [];
       coin.x = msg.coinX;
@@ -735,7 +767,43 @@ function onNetMessage(msg: NetMessage): void {
     case 'wait':
       gameStarted = false;
       break;
+    case 'diag':
+      if (netRole === 'host' && debugEnabled()) showDiag(msg);
+      break;
   }
+}
+
+// Host-only: render one comparison line for an incoming guest digest. The guest
+// frame is ~½ RTT old, so Δtick folds in latency; the spawn-signature check is
+// latency-independent (keyed by ordinal) and is the real seed-sync test. A red
+// line means a genuine divergence (enemy stream or coin), grey means we can't
+// compare yet (host hasn't reached that spawn ordinal).
+function showDiag(g: DiagMsg): void {
+  let seq: string;
+  let ok: boolean | undefined;
+  if (g.sigN < 0) {
+    seq = 'seq —';
+  } else {
+    const own = hostSpawns[g.sigN];
+    if (!own) {
+      seq = `seq#${g.sigN} host-behind`;
+    } else {
+      ok = own.dir === g.sigDir && own.sprite === g.sigSprite;
+      seq = ok
+        ? `seq#${g.sigN}✓`
+        : `seq#${g.sigN}✗ G(d${g.sigDir},s${g.sigSprite}) H(d${own.dir},s${own.sprite})`;
+    }
+  }
+  const hx = Math.round(coin.x);
+  const hy = Math.round(coin.y);
+  const coinOk = Math.abs(hx - g.coinX) <= 2 && Math.abs(hy - g.coinY) <= 2;
+  const line =
+    `G t${g.tick} sp${g.spawns} coin(${g.coinX},${g.coinY}) p${g.points} h${g.health}` +
+    ` | H t${netTick} sp${spawnCount} coin(${hx},${hy}) p${points} h${health}` +
+    ` | ${seq} coin${coinOk ? '✓' : '✗'} Δt${netTick - g.tick}`;
+  // Red on any confirmed mismatch; otherwise green when both checks pass, grey
+  // when the seq check is still indeterminate.
+  diagLine(line, ok === false || !coinOk ? false : ok === true ? true : undefined);
 }
 
 // Host: seed and broadcast a (re)start. `fresh` resets score/health for a new
@@ -751,6 +819,7 @@ function startMatchHost(fresh: boolean): void {
   count = 0;
   nextSpawn = null;
   damageCooldown = 0;
+  resetDiag();
   for (const b of blocks) b.destroy();
   blocks = [];
   placeCoin();
@@ -792,6 +861,7 @@ function drawGameplayOnline(): void {
   const isHost = netRole === 'host';
   const localShip = isHost ? UFO1 : UFO2;
   const remoteShip = isHost ? UFO2 : UFO1;
+  netTick++;
 
   if (!nextSpawn) decideNextSpawn();
 
@@ -817,6 +887,23 @@ function drawGameplayOnline(): void {
 
   // Tell the other client where we are.
   session?.send({ t: 'pos', x: Math.round(localShip.x), y: Math.round(localShip.y) });
+
+  // Guest pipes a periodic digest back to the host for the desync log (~2/s).
+  // Sent unconditionally — the host decides whether to display it (?debug=1).
+  if (netRole === 'guest' && netTick % 15 === 0) {
+    session?.send({
+      t: 'diag',
+      tick: netTick,
+      spawns: spawnCount,
+      sigN: lastSpawnN,
+      sigDir: lastSpawnDir,
+      sigSprite: lastSpawnSprite,
+      coinX: Math.round(coin.x),
+      coinY: Math.round(coin.y),
+      points,
+      health,
+    });
+  }
 
   drawSprite(backGround);
   drawSpawnIndicator();

@@ -3,6 +3,7 @@
 export {
   type CoinMsg,
   type DamageMsg,
+  type DiagMsg,
   decode,
   encode,
   type NetMessage,
