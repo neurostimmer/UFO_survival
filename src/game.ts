@@ -77,8 +77,8 @@ let session: Session | null = null;
 // The other player's most recent ship position (host sees the guest's, guest
 // sees the host's). Applied directly so the host's collision checks use the
 // real position, not a smoothed one.
-let remoteX = 200;
-let remoteY = 200;
+let remoteX = 400; // field-center default until the first pos arrives
+let remoteY = 400;
 // Host: whether the current match's `start` has been sent. Guest: whether a
 // `start` has been received (gates the gameplay screen vs the waiting screen).
 let onlineMatchStarted = false;
@@ -112,13 +112,13 @@ function resetDiag(): void {
 // prediction, hiding ½-RTT lag and dropped-packet jitter. Render-only: the host
 // still collides on the raw position. See the netcode notes in CLAUDE.md.
 let remoteSmoothing = false;
-let predX = 200; // dead-reckon anchor: last received pos, advanced each tick
-let predY = 200;
+let predX = 400; // dead-reckon anchor: last received pos, advanced each tick
+let predY = 400;
 let predVX = 0; // last received velocity
 let predVY = 0;
 let predStale = 0; // ticks since the last pos update (caps runaway extrapolation)
-let dispX = 200; // smoothed position actually drawn
-let dispY = 200;
+let dispX = 400; // smoothed position actually drawn
+let dispY = 400;
 const REMOTE_SMOOTH = 0.5; // exponential-smoothing factor toward the prediction
 const PREDICT_CAP = 10; // stop extrapolating after this many tickless updates (~⅓ s)
 
@@ -149,7 +149,22 @@ let enemyIcon: Sprite | null = null;
 type SpawnTarget = { direction: 1 | 2 | 3 | 4; x: number; y: number };
 let nextSpawn: SpawnTarget | null = null;
 
-const FIELD = 400;
+// Play-field geometry. The field doubled from the original 400 → 800; the
+// movement dynamics below double with it so the FEEL is identical on the bigger
+// axis (same jump-height fraction, traversal time, threat density). Entity
+// sprite scales and the spawn-indicator effect sizes are deliberately NOT
+// scaled — on the bigger field they read as smaller, finer-grained targets.
+const FIELD = 800;
+const MID = FIELD / 2; // field center — ship spawn / respawn point
+const EDGE = 10; // spawn + cleanup margin just outside the field (block-sized; unscaled)
+const COIN_INSET = 50; // coin keep-off-the-walls inset (coin sprite size unchanged; unscaled)
+
+const SHIP_JUMP = -24; // jump impulse (was -12)
+const SHIP_SPEED = 10; // horizontal speed (was 5)
+const GRAVITY = 3; // per-tick downward accel (was 1.5)
+const RESPAWN_IMPULSE = -30; // upward kick on respawn (was -15)
+const BLOCK_SPEED = 10; // enemy travel speed (was 5)
+
 // Gaussian indicator. The marker is a 2D radial Gaussian anchored at the
 // wall-coord nearest the spawn point — the half outside the canvas is
 // naturally clipped, so what's visible is the "edge-bright, fades into the
@@ -164,26 +179,29 @@ const ALPHA_PEAK_INITIAL = 0.5;
 const ALPHA_PEAK_FINAL = 1.0;
 const GAUSSIAN_RADIUS_SIGMAS = 3; // outer gradient radius in σ units (~99.7%)
 
-// Mouse hit-rects for menu items. Coords are logical canvas pixels (400×400).
-const TITLE_1P_RECT = { x: 60, y: 318, w: 290, h: 22 };
-const TITLE_2P_RECT = { x: 40, y: 340, w: 320, h: 22 };
-const DIFF_EASY_RECT = { x: 90, y: 135, w: 200, h: 30 };
-const DIFF_NORMAL_RECT = { x: 90, y: 185, w: 230, h: 30 };
-const DIFF_HARD_RECT = { x: 90, y: 235, w: 200, h: 30 };
+// Mouse hit-rects for menu items. Coords are logical canvas pixels (800×800).
+const TITLE_1P_RECT = { x: 120, y: 636, w: 580, h: 44 };
+const TITLE_2P_RECT = { x: 80, y: 680, w: 640, h: 44 };
+const DIFF_EASY_RECT = { x: 180, y: 270, w: 400, h: 60 };
+const DIFF_NORMAL_RECT = { x: 180, y: 370, w: 460, h: 60 };
+const DIFF_HARD_RECT = { x: 180, y: 470, w: 400, h: 60 };
 const HOVER_BG = 'rgba(255, 255, 255, 0.12)';
 
-// Title "host online" entry + lobby copy-button hit-rects (logical 400×400 px).
-const TITLE_HOST_RECT = { x: 40, y: 362, w: 340, h: 22 };
-const COPY_RECT = { x: 80, y: 215, w: 240, h: 28 };
+// Title "host online" entry + lobby copy-button hit-rects (logical 800×800 px).
+const TITLE_HOST_RECT = { x: 80, y: 724, w: 680, h: 44 };
+const COPY_RECT = { x: 160, y: 430, w: 480, h: 56 };
 
 export function init(): void {
-  backGround = createSprite(200, 200, 400, 400);
+  backGround = createSprite(MID, MID, FIELD, FIELD);
   backGround.setAnimation('space_1');
+  // Interim: stretch the 400² starfield to cover the 800² field until the
+  // non-tiled 800² art lands (next unit). setAnimation leaves scale untouched.
+  backGround.scale = 2;
   // PARITY: original passes 0.1 as both width and height — nonsensical, but
   // setAnimation immediately overrides those with the loaded image's natural
   // size, so the values never matter.
-  UFO1 = createSprite(100, 200, 0.1, 0.1);
-  UFO2 = createSprite(100, 200, 0.1, 0.1);
+  UFO1 = createSprite(200, MID, 0.1, 0.1);
+  UFO2 = createSprite(200, MID, 0.1, 0.1);
   UFO1.scale = 0.1;
   UFO2.scale = 0.1;
   coin = createSprite(-100, -100);
@@ -228,18 +246,18 @@ function drawGameplay(): void {
   UFO1.setAnimation('ufo_1');
   UFO2.setAnimation('ufo_2');
 
-  if (keyWentDown('up')) UFO1.velocityY = -12;
-  if (keyWentDown('w')) UFO2.velocityY = -12;
+  if (keyWentDown('up')) UFO1.velocityY = SHIP_JUMP;
+  if (keyWentDown('w')) UFO2.velocityY = SHIP_JUMP;
 
   UFO1.velocityX = 0;
   UFO2.velocityX = 0;
-  if (keyDown('left')) UFO1.velocityX = -5;
-  if (keyDown('right')) UFO1.velocityX = 5;
-  if (keyDown('a')) UFO2.velocityX = -5;
-  if (keyDown('d')) UFO2.velocityX = 5;
+  if (keyDown('left')) UFO1.velocityX = -SHIP_SPEED;
+  if (keyDown('right')) UFO1.velocityX = SHIP_SPEED;
+  if (keyDown('a')) UFO2.velocityX = -SHIP_SPEED;
+  if (keyDown('d')) UFO2.velocityX = SHIP_SPEED;
 
-  UFO2.velocityY += 1.5;
-  UFO1.velocityY += 1.5;
+  UFO2.velocityY += GRAVITY;
+  UFO1.velocityY += GRAVITY;
 
   // Draw order: background → indicator (under sprites so the player can fly
   // over it) → all other sprites → HUD. drawSprites() would redraw the
@@ -252,11 +270,11 @@ function drawGameplay(): void {
   drawSprite(coin);
   for (const b of blocks) drawSprite(b);
 
-  textSize(20);
+  textSize(40);
   fill('red');
-  text(`Health: ${health}`, 300, 20);
+  text(`Health: ${health}`, 600, 40);
   fill('green');
-  text(`Points: ${points}`, 300, 50);
+  text(`Points: ${points}`, 600, 100);
 
   count++;
 
@@ -268,8 +286,8 @@ function drawGameplay(): void {
 
   if (!coinExists) {
     coin.setAnimation('coin');
-    coin.y = randomNumber(50, 350);
-    coin.x = randomNumber(50, 350);
+    coin.y = randomNumber(COIN_INSET, FIELD - COIN_INSET);
+    coin.x = randomNumber(COIN_INSET, FIELD - COIN_INSET);
     coinExists = true;
     coin.scale = 0.4;
   }
@@ -277,7 +295,7 @@ function drawGameplay(): void {
   if (UFO1.isTouching(coin) || (UFO2.isTouching(coin) && players === 3)) {
     points++;
     coinExists = false;
-    coin.y = 500;
+    coin.y = FIELD + 100;
   }
 
   //Fixed an issue where offscreened blocks were only cleared when going downward
@@ -285,7 +303,10 @@ function drawGameplay(): void {
     const currentBlock = blocks[i];
     if (
       currentBlock &&
-      (currentBlock.x < -10 || currentBlock.x > 410 || currentBlock.y < -10 || currentBlock.y > 410)
+      (currentBlock.x < -EDGE ||
+        currentBlock.x > FIELD + EDGE ||
+        currentBlock.y < -EDGE ||
+        currentBlock.y > FIELD + EDGE)
     ) {
       currentBlock.destroy();
       blocks.splice(i, 1);
@@ -293,10 +314,10 @@ function drawGameplay(): void {
   }
 
   // Wall damage. P1 always; P2 only in 2P (`players === 3`).
-  if (UFO1.y < 0 || UFO1.y > 400 || UFO1.x < 0 || UFO1.x > 400) {
+  if (UFO1.y < 0 || UFO1.y > FIELD || UFO1.x < 0 || UFO1.x > FIELD) {
     handleDamage();
   }
-  if ((UFO2.y < 0 || UFO2.y > 400 || UFO2.x < 0 || UFO2.x > 400) && players === 3) {
+  if ((UFO2.y < 0 || UFO2.y > FIELD || UFO2.x < 0 || UFO2.x > FIELD) && players === 3) {
     handleDamage();
   }
 
@@ -320,17 +341,17 @@ function decideNextSpawn(): void {
   let x = 0;
   let y = 0;
   if (direction === 1) {
-    x = 410;
-    y = randomNumber(10, 390);
+    x = FIELD + EDGE;
+    y = randomNumber(EDGE, FIELD - EDGE);
   } else if (direction === 2) {
-    x = randomNumber(10, 390);
-    y = 410;
+    x = randomNumber(EDGE, FIELD - EDGE);
+    y = FIELD + EDGE;
   } else if (direction === 3) {
-    x = -10;
-    y = randomNumber(10, 390);
+    x = -EDGE;
+    y = randomNumber(EDGE, FIELD - EDGE);
   } else {
-    x = randomNumber(10, 390);
-    y = -10;
+    x = randomNumber(EDGE, FIELD - EDGE);
+    y = -EDGE;
   }
   nextSpawn = { direction, x, y };
 }
@@ -342,10 +363,10 @@ function spawnBlock(): void {
   const newBlock = createSprite(target.x, target.y);
   newBlock.direction = target.direction;
   newBlock.scale = 0.2;
-  if (target.direction === 1) newBlock.velocityX = -5;
-  else if (target.direction === 2) newBlock.velocityY = -5;
-  else if (target.direction === 3) newBlock.velocityX = 5;
-  else newBlock.velocityY = 5;
+  if (target.direction === 1) newBlock.velocityX = -BLOCK_SPEED;
+  else if (target.direction === 2) newBlock.velocityY = -BLOCK_SPEED;
+  else if (target.direction === 3) newBlock.velocityX = BLOCK_SPEED;
+  else newBlock.velocityY = BLOCK_SPEED;
 
   const randomIndex = randomNumber(0, shipAnimations.length - 1);
   const name = shipAnimations[randomIndex];
@@ -444,11 +465,11 @@ function drawNonGameplay(): void {
     // PARITY: original sets health = 11 (one extra HP after restart).
     health = 11;
     points = 0;
-    UFO1.y = 600;
+    UFO1.y = FIELD + 400;
     UFO1.velocityY = 0;
     UFO1.velocityX = 0;
     if (players > 2) {
-      UFO2.y = 600;
+      UFO2.y = FIELD + 400;
       UFO2.velocityY = 0;
       UFO2.velocityX = 0;
     }
@@ -464,23 +485,24 @@ function drawNonGameplay(): void {
 function drawGameOver(): void {
   background('black');
   fill('red');
-  textSize(70);
+  textSize(140);
   textAlign(CENTER, CENTER);
-  text('Game Over!', 200, 150);
-  textSize(20);
-  text(`Your score: ${points}`, 200, 250);
-  // PARITY: original has x = 199 (typo — every other label uses 200).
-  text('press R to restart', 199, 300);
+  text('Game Over!', MID, 300);
+  textSize(40);
+  text(`Your score: ${points}`, MID, 500);
+  // PARITY: original has x = 199 (typo — every other label uses 200), preserved
+  // here doubled (398) for fidelity to the off-by-one.
+  text('press R to restart', 398, 600);
 }
 
 function drawWin(): void {
   fill('green');
-  textSize(70);
+  textSize(140);
   textAlign(CENTER, CENTER);
-  text('You Win!', 200, 150);
-  textSize(20);
-  text(`Final Health: ${health}`, 200, 250);
-  text('press C to keep going!', 200, 275);
+  text('You Win!', MID, 300);
+  textSize(40);
+  text(`Final Health: ${health}`, MID, 500);
+  text('press C to keep going!', MID, 550);
   // PARITY: original is keyWentDown("C") with literal uppercase. The input
   // shim lowercases internally so this matches both shifted and unshifted C.
   if (keyWentDown('C')) {
@@ -495,33 +517,33 @@ function drawDifficultySelect(): void {
   backGround.setAnimation('space_1');
   fill('white');
   drawSprites();
-  textSize(50);
-  text('Select difficulty:', 20, 100);
-  textSize(20);
+  textSize(100);
+  text('Select difficulty:', 40, 200);
+  textSize(40);
 
   if (mouseOver(DIFF_EASY_RECT.x, DIFF_EASY_RECT.y, DIFF_EASY_RECT.w, DIFF_EASY_RECT.h)) {
     fill(HOVER_BG);
     rect(DIFF_EASY_RECT.x, DIFF_EASY_RECT.y, DIFF_EASY_RECT.w, DIFF_EASY_RECT.h);
   }
   fill('green');
-  text('press 1 for easy', 100, 150);
+  text('press 1 for easy', 200, 300);
 
   if (mouseOver(DIFF_NORMAL_RECT.x, DIFF_NORMAL_RECT.y, DIFF_NORMAL_RECT.w, DIFF_NORMAL_RECT.h)) {
     fill(HOVER_BG);
     rect(DIFF_NORMAL_RECT.x, DIFF_NORMAL_RECT.y, DIFF_NORMAL_RECT.w, DIFF_NORMAL_RECT.h);
   }
   fill('yellow');
-  text('press 2 for normal', 100, 200);
+  text('press 2 for normal', 200, 400);
 
   if (mouseOver(DIFF_HARD_RECT.x, DIFF_HARD_RECT.y, DIFF_HARD_RECT.w, DIFF_HARD_RECT.h)) {
     fill(HOVER_BG);
     rect(DIFF_HARD_RECT.x, DIFF_HARD_RECT.y, DIFF_HARD_RECT.w, DIFF_HARD_RECT.h);
   }
   fill('red');
-  text('press 3 for hard', 100, 250);
+  text('press 3 for hard', 200, 500);
 
-  textSize(15);
-  text('Game designed and coded by Hyrum Adams', 50, 300);
+  textSize(30);
+  text('Game designed and coded by Hyrum Adams', 100, 600);
   if (players === 1) {
     // PARITY: 1P mode parks UFO2 far offscreen so drawSprites doesn't render it.
     UFO2.y = 10000;
@@ -546,65 +568,65 @@ function drawDifficultySelect(): void {
 function drawTitle(): void {
   background('black');
   textAlign(LEFT, TOP);
-  textSize(40);
+  textSize(80);
   fill('white');
-  text('🚀 UFO Survival', 60, 30);
+  text('🚀 UFO Survival', 120, 60);
 
   if (!UFOIcon) {
-    UFOIcon = createSprite(50, 160);
+    UFOIcon = createSprite(100, 320);
     UFOIcon.setAnimation('ufo_1');
     UFOIcon.scale = 0.08;
   }
   if (!UFO2Icon) {
-    UFO2Icon = createSprite(50, 190);
+    UFO2Icon = createSprite(100, 380);
     UFO2Icon.setAnimation('ufo_2');
     UFO2Icon.scale = 0.08;
   }
   if (!coinIcon) {
-    coinIcon = createSprite(50, 250);
+    coinIcon = createSprite(100, 500);
     coinIcon.setAnimation('coin');
     coinIcon.scale = 0.4;
   }
   if (!enemyIcon) {
-    enemyIcon = createSprite(50, 220);
+    enemyIcon = createSprite(100, 440);
     enemyIcon.setAnimation('retroship_02_1');
     enemyIcon.scale = 0.08;
   }
 
-  textSize(20);
+  textSize(40);
   fill('lightblue');
-  text('Controls:', 50, 120);
+  text('Controls:', 100, 240);
   fill('white');
-  text('- Arrow keys to move (1st player)', 70, 150);
-  text('- Use WASD to move (2nd player)', 70, 180);
-  text('- Avoid enemy ships!', 70, 210);
-  text('- Collect coins for points', 70, 240);
-  text('- If your health reaches 0, you lose.', 70, 270);
+  text('- Arrow keys to move (1st player)', 140, 300);
+  text('- Use WASD to move (2nd player)', 140, 360);
+  text('- Avoid enemy ships!', 140, 420);
+  text('- Collect coins for points', 140, 480);
+  text('- If your health reaches 0, you lose.', 140, 540);
 
   fill('yellow');
-  text(`Goal: Get ${winCon} points to win!`, 60, 296);
+  text(`Goal: Get ${winCon} points to win!`, 120, 592);
 
-  textSize(18);
+  textSize(36);
   if (mouseOver(TITLE_1P_RECT.x, TITLE_1P_RECT.y, TITLE_1P_RECT.w, TITLE_1P_RECT.h)) {
     fill(HOVER_BG);
     rect(TITLE_1P_RECT.x, TITLE_1P_RECT.y, TITLE_1P_RECT.w, TITLE_1P_RECT.h);
   }
   fill('orange');
-  text('Press SPACE for one player', 70, 322);
+  text('Press SPACE for one player', 140, 644);
 
   if (mouseOver(TITLE_2P_RECT.x, TITLE_2P_RECT.y, TITLE_2P_RECT.w, TITLE_2P_RECT.h)) {
     fill(HOVER_BG);
     rect(TITLE_2P_RECT.x, TITLE_2P_RECT.y, TITLE_2P_RECT.w, TITLE_2P_RECT.h);
   }
   fill('orange');
-  text('Press BACKSPACE for two player!', 50, 344);
+  text('Press BACKSPACE for two player!', 100, 688);
 
   if (mouseOver(TITLE_HOST_RECT.x, TITLE_HOST_RECT.y, TITLE_HOST_RECT.w, TITLE_HOST_RECT.h)) {
     fill(HOVER_BG);
     rect(TITLE_HOST_RECT.x, TITLE_HOST_RECT.y, TITLE_HOST_RECT.w, TITLE_HOST_RECT.h);
   }
   fill('aqua');
-  text('Press O to host online co-op', 50, 366);
+  text('Press O to host online co-op', 100, 732);
 
   // Capture locals after lazy-init so TS narrowing survives across the
   // remaining draw/destroy calls.
@@ -655,13 +677,13 @@ function drawTitle(): void {
 
 function handleDamage(): void {
   health--;
-  UFO1.y = 200;
-  UFO1.x = 200;
-  UFO1.velocityY = -15;
+  UFO1.y = MID;
+  UFO1.x = MID;
+  UFO1.velocityY = RESPAWN_IMPULSE;
   if (players > 2) {
-    UFO2.y = 200;
-    UFO2.x = 200;
-    UFO2.velocityY = -15;
+    UFO2.y = MID;
+    UFO2.x = MID;
+    UFO2.velocityY = RESPAWN_IMPULSE;
   }
   background(rgb(255, 0, 0, 0.5));
   for (const b of blocks) b.destroy();
@@ -736,22 +758,22 @@ function ownShip(): Sprite {
 
 function respawnOwnShip(): void {
   const s = ownShip();
-  s.x = 200;
-  s.y = 200;
+  s.x = MID;
+  s.y = MID;
   s.velocityX = 0;
-  s.velocityY = -15;
+  s.velocityY = RESPAWN_IMPULSE;
 }
 
 function offField(s: Sprite): boolean {
-  return s.x < 0 || s.x > 400 || s.y < 0 || s.y > 400;
+  return s.x < 0 || s.x > FIELD || s.y < 0 || s.y > FIELD;
 }
 
 // Coins are host-authoritative (who grabs one depends on both ships), so the
 // host picks positions from Math.random — NOT the seeded RNG — to keep the
 // shared enemy stream byte-identical on both clients.
 function placeCoin(): void {
-  coin.x = Math.round(50 + Math.random() * 300);
-  coin.y = Math.round(50 + Math.random() * 300);
+  coin.x = Math.round(COIN_INSET + Math.random() * (FIELD - 2 * COIN_INSET));
+  coin.y = Math.round(COIN_INSET + Math.random() * (FIELD - 2 * COIN_INSET));
   coinExists = true;
 }
 
@@ -909,11 +931,11 @@ function drawGameplayOnline(): void {
   coin.scale = 0.4;
 
   // Local ship: live input + physics (zero lag).
-  if (keyWentDown('up')) localShip.velocityY = -12;
+  if (keyWentDown('up')) localShip.velocityY = SHIP_JUMP;
   localShip.velocityX = 0;
-  if (keyDown('left')) localShip.velocityX = -5;
-  if (keyDown('right')) localShip.velocityX = 5;
-  localShip.velocityY += 1.5;
+  if (keyDown('left')) localShip.velocityX = -SHIP_SPEED;
+  if (keyDown('right')) localShip.velocityX = SHIP_SPEED;
+  localShip.velocityY += GRAVITY;
 
   // Remote ship: never moved by local physics — we place it explicitly each
   // tick. With ?smooth=1 we draw a dead-reckoned + smoothed position to hide the
@@ -923,7 +945,7 @@ function drawGameplayOnline(): void {
   remoteShip.velocityY = 0;
   if (remoteSmoothing) {
     if (predStale < PREDICT_CAP) {
-      predVY += 1.5; // mirror the ship's gravity so the predicted arc stays true
+      predVY += GRAVITY; // mirror the ship's gravity so the predicted arc stays true
       predX += predVX;
       predY += predVY;
       predStale++;
@@ -972,11 +994,11 @@ function drawGameplayOnline(): void {
   for (const b of blocks) drawSprite(b);
 
   textAlign(LEFT, CENTER);
-  textSize(20);
+  textSize(40);
   fill('red');
-  text(`Health: ${health}`, 300, 20);
+  text(`Health: ${health}`, 600, 40);
   fill('green');
-  text(`Points: ${points}`, 300, 50);
+  text(`Points: ${points}`, 600, 100);
 
   // Deterministic enemy spawning + cleanup — identical on both via the seed.
   count++;
@@ -986,7 +1008,7 @@ function drawGameplayOnline(): void {
   }
   for (let i = blocks.length - 1; i >= 0; i--) {
     const b = blocks[i];
-    if (b && (b.x < -10 || b.x > 410 || b.y < -10 || b.y > 410)) {
+    if (b && (b.x < -EDGE || b.x > FIELD + EDGE || b.y < -EDGE || b.y > FIELD + EDGE)) {
       b.destroy();
       blocks.splice(i, 1);
     }
@@ -1048,13 +1070,13 @@ function drawOnlineMenus(): void {
 
 function drawWinOnline(): void {
   fill('green');
-  textSize(70);
+  textSize(140);
   textAlign(CENTER, CENTER);
-  text('You Win!', 200, 150);
+  text('You Win!', MID, 300);
   fill('white');
-  textSize(20);
-  text(`Final Health: ${health}`, 200, 250);
-  text('press C to keep going!', 200, 275);
+  textSize(40);
+  text(`Final Health: ${health}`, MID, 500);
+  text('press C to keep going!', MID, 550);
 }
 
 function hostRestartToSelect(): void {
@@ -1087,31 +1109,31 @@ function drawHostLobby(): void {
   background('black');
   textAlign(CENTER, CENTER);
   fill('white');
-  textSize(30);
-  text('Online co-op', 200, 50);
+  textSize(60);
+  text('Online co-op', MID, 100);
 
   if (netStatus === 'disconnected') {
     fill('red');
-    textSize(22);
-    text('Player 2 disconnected.', 200, 180);
+    textSize(44);
+    text('Player 2 disconnected.', MID, 360);
     fill('white');
-    textSize(16);
-    text('Press R to return to the menu', 200, 220);
+    textSize(32);
+    text('Press R to return to the menu', MID, 440);
     if (keyWentDown('r')) resetToLocalTitle();
     return;
   }
 
   fill('yellow');
-  textSize(24);
-  text(`Room code: ${roomCode}`, 200, 110);
+  textSize(48);
+  text(`Room code: ${roomCode}`, MID, 220);
 
   fill('white');
-  textSize(14);
-  text('Share this link with player 2:', 200, 160);
+  textSize(28);
+  text('Share this link with player 2:', MID, 320);
   fill('aqua');
-  textSize(11);
+  textSize(22);
   const link = shareLink(roomCode);
-  text(link, 200, 184);
+  text(link, MID, 368);
 
   fill(
     mouseOver(COPY_RECT.x, COPY_RECT.y, COPY_RECT.w, COPY_RECT.h)
@@ -1120,16 +1142,16 @@ function drawHostLobby(): void {
   );
   rect(COPY_RECT.x, COPY_RECT.y, COPY_RECT.w, COPY_RECT.h);
   fill('white');
-  textSize(16);
-  text('Click to copy link', 200, COPY_RECT.y + COPY_RECT.h / 2);
+  textSize(32);
+  text('Click to copy link', MID, COPY_RECT.y + COPY_RECT.h / 2);
   if (mouseClickedIn(COPY_RECT.x, COPY_RECT.y, COPY_RECT.w, COPY_RECT.h)) copyLink(link);
 
   fill('lightgray');
-  textSize(17);
-  text('Waiting for player 2 to join…', 200, 300);
+  textSize(34);
+  text('Waiting for player 2 to join…', MID, 600);
   fill('gray');
-  textSize(13);
-  text('Press R to cancel', 200, 340);
+  textSize(26);
+  text('Press R to cancel', MID, 680);
   if (keyWentDown('r')) resetToLocalTitle();
 }
 
@@ -1137,12 +1159,12 @@ function drawCenterMessage(message: string, sub?: string): void {
   background('black');
   textAlign(CENTER, CENTER);
   fill('white');
-  textSize(26);
-  text(message, 200, 190);
+  textSize(52);
+  text(message, MID, 380);
   if (sub) {
     fill('gray');
-    textSize(15);
-    text(sub, 200, 230);
+    textSize(30);
+    text(sub, MID, 460);
   }
 }
 
@@ -1171,11 +1193,11 @@ function drawGuest(): void {
 function drawGuestOverlay(title: string, color: string, sub: string): void {
   background('black');
   fill(color);
-  textSize(70);
+  textSize(140);
   textAlign(CENTER, CENTER);
-  text(title, 200, 150);
+  text(title, MID, 300);
   fill('white');
-  textSize(20);
-  text(sub, 200, 250);
-  text('Waiting for host…', 200, 300);
+  textSize(40);
+  text(sub, MID, 500);
+  text('Waiting for host…', MID, 600);
 }
