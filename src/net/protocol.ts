@@ -55,7 +55,26 @@ export interface WaitMsg {
   t: 'wait';
 }
 
-export type NetMessage = StartMsg | PosMsg | CoinMsg | DamageMsg | WaitMsg;
+// Guest → host, debug only (?debug=1 on the host). A periodic digest of the
+// guest's sim state so the host can render a desync log on one screen instead of
+// diffing two browser consoles. `sigN`/`sigDir`/`sigSprite` are the guest's
+// most-recent spawn signature (ordinal + the two seeded draws that define the
+// enemy) — comparing them against the host's own record of spawn #sigN is the
+// latency-independent test of whether the shared seed actually stayed in sync.
+export interface DiagMsg {
+  t: 'diag';
+  tick: number; // sender's online-frame counter since match start
+  spawns: number; // total enemies spawned so far
+  sigN: number; // ordinal of the most recent spawn (-1 if none yet)
+  sigDir: number; // that spawn's direction draw
+  sigSprite: number; // that spawn's sprite-index draw
+  coinX: number;
+  coinY: number;
+  points: number;
+  health: number;
+}
+
+export type NetMessage = StartMsg | PosMsg | CoinMsg | DamageMsg | WaitMsg | DiagMsg;
 
 export function encode(msg: NetMessage): string {
   return JSON.stringify(msg);
@@ -99,6 +118,29 @@ export function decode(raw: string): NetMessage | null {
       return num(v.health) ? { t: 'damage', health: v.health } : null;
     case 'wait':
       return { t: 'wait' };
+    case 'diag':
+      return num(v.tick) &&
+        num(v.spawns) &&
+        num(v.sigN) &&
+        num(v.sigDir) &&
+        num(v.sigSprite) &&
+        num(v.coinX) &&
+        num(v.coinY) &&
+        num(v.points) &&
+        num(v.health)
+        ? {
+            t: 'diag',
+            tick: v.tick,
+            spawns: v.spawns,
+            sigN: v.sigN,
+            sigDir: v.sigDir,
+            sigSprite: v.sigSprite,
+            coinX: v.coinX,
+            coinY: v.coinY,
+            points: v.points,
+            health: v.health,
+          }
+        : null;
     default:
       return null;
   }
