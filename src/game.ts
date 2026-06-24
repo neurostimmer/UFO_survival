@@ -79,9 +79,8 @@ let session: Session | null = null;
 // real position, not a smoothed one.
 let remoteX = 400; // field-center default until the first pos arrives
 let remoteY = 400;
-// Host: whether the current match's `start` has been sent. Guest: whether a
-// `start` has been received (gates the gameplay screen vs the waiting screen).
-let onlineMatchStarted = false;
+// Guest: whether a `start` has been received (gates the gameplay screen vs the
+// waiting screen). The host's equivalent is the explicit `onlineScreen` flow.
 let gameStarted = false;
 // Host-only: suppresses repeat damage from a networked off-field ship for a few
 // ticks (the host can't force the remote ship back on-field; the guest's own
@@ -129,6 +128,46 @@ function resetRemoteSmoothing(): void {
   predVX = predVY = 0;
   predStale = 0;
 }
+
+// --- Competitive online play -----------------------------------------------
+// Compete differs from co-op in three places: HP and coins are PER-PLAYER (not
+// shared); each client is self-authoritative for its OWN ship (its own wall/
+// enemy hits and its own independent coin — coins are never contested, so ½-RTT
+// can't steal one); and damage does NOT wipe the shared seeded enemy field, so
+// both clients keep advancing the identical wave. The host arbitrates only the
+// win/loss OUTCOME (first to the coin goal wins; 0 HP loses) so the two ends
+// can't disagree. `matchMode` is set from the `start` event on the guest and
+// from the mode-select screen on the host.
+type MatchMode = 'coop' | 'compete';
+let matchMode: MatchMode = 'coop';
+// The opponent's own counters, received via `pos`. Only read in compete (drawn
+// as the "Foe" HUD; the host arbitrates win/loss from them).
+let oppHealth = 10;
+let oppPoints = 0;
+// Session-only win tally (lives on the host; broadcast in `result`). Never
+// persisted across sessions — reset only in resetToLocalTitle().
+let hostWins = 0;
+let guestWins = 0;
+// Set once the host decides the outcome (and on the guest when `result` lands);
+// drives the match-end screen on both ends. Cleared at the next match start.
+let matchResult: { winner: 'host' | 'guest'; hostWins: number; guestWins: number } | null = null;
+
+// Host-chosen compete settings (the config screen). Starting HP and coin goal,
+// each an integer 1–99.
+let competeHP = 10;
+let competeGoal = 25;
+
+// Host online screen flow (only meaningful while netRole === 'host'). The guest
+// has no menus — it follows the host's `start`/`wait`/`result` events.
+//   lobby is handled separately by netStatus; from 'connected' the host walks
+//   mode → (config, compete only) → select → play → end.
+type OnlineScreen = 'mode' | 'config' | 'select' | 'play' | 'end';
+let onlineScreen: OnlineScreen = 'mode';
+
+// Compete-config keyboard entry: which field a typed digit edits, and the
+// in-progress digit buffer for it. null = no field focused (presets only).
+let configFocus: 'hp' | 'goal' | null = null;
+let configBuf = '';
 
 const shipAnimations: string[] = [];
 for (let i = 1; i <= 21; i++) {
@@ -194,9 +233,8 @@ const COPY_RECT = { x: 160, y: 430, w: 480, h: 56 };
 export function init(): void {
   backGround = createSprite(MID, MID, FIELD, FIELD);
   backGround.setAnimation('space_1');
-  // Interim: stretch the 400² starfield to cover the 800² field until the
-  // non-tiled 800² art lands (next unit). setAnimation leaves scale untouched.
-  backGround.scale = 2;
+  // space_1 is now native 800² art (scripts/gen_background.py), so it covers the
+  // field at scale 1 — no stretch.
   // PARITY: original passes 0.1 as both width and height — nonsensical, but
   // setAnimation immediately overrides those with the loaded image's natural
   // size, so the values never matter.
@@ -697,8 +735,8 @@ function startHosting(): void {
   netStatus = 'waiting';
   roomCode = makeRoomCode();
   players = 3; // two ships active
-  difficulty = -1; // once a guest connects, the host lands on difficulty select
-  onlineMatchStarted = false;
+  difficulty = -1;
+  onlineScreen = 'mode'; // once a guest connects, the host picks co-op vs compete
   session = hostSession(roomCode, {
     onMessage: onNetMessage,
     onConnected: () => {
@@ -733,7 +771,6 @@ function resetToLocalTitle(): void {
   netRole = 'local';
   netStatus = 'idle';
   roomCode = '';
-  onlineMatchStarted = false;
   gameStarted = false;
   damageCooldown = 0;
   resetDiag();
@@ -748,6 +785,18 @@ function resetToLocalTitle(): void {
   coinExists = false;
   nextSpawn = null;
   difficulty = -2;
+  // Compete state is session-scoped — reset it all when leaving online play.
+  matchMode = 'coop';
+  oppHealth = 10;
+  oppPoints = 0;
+  hostWins = 0;
+  guestWins = 0;
+  matchResult = null;
+  onlineScreen = 'mode';
+  competeHP = 10;
+  competeGoal = 25;
+  configFocus = null;
+  configBuf = '';
   setRandomSeed(null); // restore non-deterministic local play
 }
 
@@ -784,6 +833,9 @@ function onNetMessage(msg: NetMessage): void {
     case 'pos':
       remoteX = msg.x;
       remoteY = msg.y;
+      // Opponent's own counters (compete HUD + host win/loss arbitration).
+      oppHealth = msg.hp;
+      oppPoints = msg.coins;
       // Re-anchor the dead-reckoner on each authoritative sample (used only when
       // ?smooth=1; harmless otherwise).
       predX = msg.x;
@@ -793,22 +845,34 @@ function onNetMessage(msg: NetMessage): void {
       predStale = 0;
       break;
     case 'start':
+      matchMode = msg.mode;
       setRandomSeed(msg.seed);
       difficulty = msg.difficulty;
       health = msg.health;
       points = msg.points;
       winCon = msg.winCon;
+      oppHealth = msg.health; // both sides start equal
+      oppPoints = msg.points;
       count = 0;
       nextSpawn = null;
       damageCooldown = 0;
+      matchResult = null;
       resetDiag();
       resetRemoteSmoothing();
       for (const b of blocks) b.destroy();
       blocks = [];
-      coin.x = msg.coinX;
-      coin.y = msg.coinY;
-      coinExists = true;
+      if (msg.mode === 'compete') {
+        // Each client runs its OWN coin locally; force a fresh local placement.
+        coinExists = false;
+      } else {
+        coin.x = msg.coinX;
+        coin.y = msg.coinY;
+        coinExists = true;
+      }
       gameStarted = true;
+      break;
+    case 'result':
+      matchResult = { winner: msg.winner, hostWins: msg.hostWins, guestWins: msg.guestWins };
       break;
     case 'coin':
       points = msg.points;
@@ -824,6 +888,7 @@ function onNetMessage(msg: NetMessage): void {
       break;
     case 'wait':
       gameStarted = false;
+      matchResult = null;
       break;
     case 'diag':
       if (netRole === 'host' && debugEnabled()) showDiag(msg);
@@ -868,10 +933,19 @@ function showDiag(g: DiagMsg): void {
 // match; a win-continue keeps them and just reseeds the enemy wave.
 function startMatchHost(fresh: boolean): void {
   if (fresh) {
-    health = 10;
-    points = 0;
-    winCon = 25;
+    if (matchMode === 'compete') {
+      health = competeHP;
+      points = 0;
+      winCon = competeGoal;
+      oppHealth = competeHP;
+      oppPoints = 0;
+    } else {
+      health = 10;
+      points = 0;
+      winCon = 25;
+    }
   }
+  matchResult = null;
   const seed = Math.floor(Math.random() * 0x7fffffff);
   setRandomSeed(seed);
   count = 0;
@@ -881,10 +955,15 @@ function startMatchHost(fresh: boolean): void {
   resetRemoteSmoothing();
   for (const b of blocks) b.destroy();
   blocks = [];
-  placeCoin();
-  onlineMatchStarted = true;
+  if (matchMode === 'compete') {
+    coinExists = false; // each client places its own coin on the first tick
+  } else {
+    placeCoin();
+  }
+  onlineScreen = 'play';
   session?.send({
     t: 'start',
+    mode: matchMode,
     seed,
     difficulty,
     health,
@@ -900,16 +979,241 @@ function drawHost(): void {
     drawHostLobby();
     return;
   }
-  const playing = health > 0 && points < winCon && difficulty > 0;
-  if (playing) {
-    if (!onlineMatchStarted) startMatchHost(true);
-    drawGameplayOnline();
-    return;
+  // Once a guest is connected the host walks an explicit screen flow:
+  // mode → (config, compete only) → difficulty select → play → match end.
+  switch (onlineScreen) {
+    case 'mode':
+      drawModeSelect();
+      return;
+    case 'config':
+      drawCompeteConfig();
+      return;
+    case 'select':
+      drawHostSelect();
+      return;
+    case 'play':
+      drawGameplayOnline();
+      return;
+    case 'end':
+      if (matchMode === 'compete') drawMatchEnd();
+      else drawOnlineMenus();
+      return;
   }
-  // Leaving gameplay (to select, or on game over) clears the match flag so the
-  // next entry seeds a fresh world; a win keeps it (the continue reseeds).
-  if (difficulty <= 0 || health === 0) onlineMatchStarted = false;
-  drawOnlineMenus();
+}
+
+// Host: choose co-op vs compete once a guest has connected. Keyboard 1/2 or
+// click. Co-op jumps straight to difficulty select; compete inserts the config
+// screen first.
+const MODE_COOP_RECT = { x: 200, y: 320, w: 400, h: 70 };
+const MODE_COMPETE_RECT = { x: 200, y: 440, w: 400, h: 70 };
+
+function drawModeSelect(): void {
+  background('black');
+  textAlign(CENTER, CENTER);
+  fill('white');
+  textSize(70);
+  text('Choose mode', MID, 160);
+
+  drawMenuButton(MODE_COOP_RECT, '1  ·  Co-op', 'lightgreen');
+  drawMenuButton(MODE_COMPETE_RECT, '2  ·  Compete', 'orange');
+
+  textSize(26);
+  fill('gray');
+  text('Co-op: shared survival.   Compete: first to the coin goal wins.', MID, 560);
+  text('Press R to cancel', MID, 700);
+
+  const wantCoop =
+    keyWentDown('1') ||
+    mouseClickedIn(MODE_COOP_RECT.x, MODE_COOP_RECT.y, MODE_COOP_RECT.w, MODE_COOP_RECT.h);
+  const wantCompete =
+    keyWentDown('2') ||
+    mouseClickedIn(
+      MODE_COMPETE_RECT.x,
+      MODE_COMPETE_RECT.y,
+      MODE_COMPETE_RECT.w,
+      MODE_COMPETE_RECT.h,
+    );
+
+  if (wantCoop) {
+    matchMode = 'coop';
+    difficulty = -1;
+    onlineScreen = 'select';
+  } else if (wantCompete) {
+    matchMode = 'compete';
+    onlineScreen = 'config';
+  } else if (keyWentDown('r')) {
+    resetToLocalTitle();
+  }
+}
+
+// A simple filled menu button with hover highlight + centered label. Used by the
+// online host menus. `rect` here is {x,y,w,h} in logical 800² px.
+function drawMenuButton(
+  r: { x: number; y: number; w: number; h: number },
+  label: string,
+  color: string,
+): void {
+  const hot = mouseOver(r.x, r.y, r.w, r.h);
+  fill(hot ? 'rgba(255,255,255,0.18)' : 'rgba(255,255,255,0.06)');
+  rect(r.x, r.y, r.w, r.h);
+  fill(color);
+  textSize(40);
+  textAlign(CENTER, CENTER);
+  text(label, r.x + r.w / 2, r.y + r.h / 2);
+}
+
+// Host compete config: pick starting HP and coin goal. Each field has three
+// presets plus a click-to-focus value box you can type a custom 1–99 into.
+const CFG_HP_PRESETS = [5, 10, 20];
+const CFG_GOAL_PRESETS = [10, 25, 50];
+const CFG_HP_BOX = { x: 560, y: 250, w: 150, h: 64 };
+const CFG_GOAL_BOX = { x: 560, y: 410, w: 150, h: 64 };
+const CFG_START_RECT = { x: 250, y: 600, w: 300, h: 72 };
+
+function presetRect(row: number, i: number): { x: number; y: number; w: number; h: number } {
+  return { x: 90 + i * 150, y: row, w: 130, h: 64 };
+}
+
+function drawCompeteConfig(): void {
+  background('black');
+  textAlign(CENTER, CENTER);
+  fill('white');
+  textSize(56);
+  text('Compete setup', MID, 110);
+
+  // --- Health row ---
+  fill('white');
+  textSize(36);
+  textAlign(LEFT, CENTER);
+  text('Health', 90, 215);
+  CFG_HP_PRESETS.forEach((v, i) => {
+    const r = presetRect(250, i);
+    const sel = competeHP === v && configFocus !== 'hp';
+    fill(
+      mouseOver(r.x, r.y, r.w, r.h)
+        ? 'rgba(255,255,255,0.18)'
+        : sel
+          ? 'rgba(120,200,120,0.30)'
+          : 'rgba(255,255,255,0.06)',
+    );
+    rect(r.x, r.y, r.w, r.h);
+    fill('white');
+    textAlign(CENTER, CENTER);
+    textSize(38);
+    text(String(v), r.x + r.w / 2, r.y + r.h / 2);
+    if (mouseClickedIn(r.x, r.y, r.w, r.h)) {
+      competeHP = v;
+      configFocus = null;
+      configBuf = '';
+    }
+  });
+  drawConfigBox(CFG_HP_BOX, competeHP, 'hp');
+
+  // --- Coin-goal row ---
+  fill('white');
+  textSize(36);
+  textAlign(LEFT, CENTER);
+  text('Coin goal', 90, 375);
+  CFG_GOAL_PRESETS.forEach((v, i) => {
+    const r = presetRect(410, i);
+    const sel = competeGoal === v && configFocus !== 'goal';
+    fill(
+      mouseOver(r.x, r.y, r.w, r.h)
+        ? 'rgba(255,255,255,0.18)'
+        : sel
+          ? 'rgba(120,200,120,0.30)'
+          : 'rgba(255,255,255,0.06)',
+    );
+    rect(r.x, r.y, r.w, r.h);
+    fill('white');
+    textAlign(CENTER, CENTER);
+    textSize(38);
+    text(String(v), r.x + r.w / 2, r.y + r.h / 2);
+    if (mouseClickedIn(r.x, r.y, r.w, r.h)) {
+      competeGoal = v;
+      configFocus = null;
+      configBuf = '';
+    }
+  });
+  drawConfigBox(CFG_GOAL_BOX, competeGoal, 'goal');
+
+  // --- Start ---
+  drawMenuButton(CFG_START_RECT, 'Start match', 'lightgreen');
+  textAlign(CENTER, CENTER);
+  fill('gray');
+  textSize(24);
+  text('Click a value box, then type 1–99.   R to cancel.', MID, 710);
+
+  handleConfigTyping();
+
+  if (mouseClickedIn(CFG_START_RECT.x, CFG_START_RECT.y, CFG_START_RECT.w, CFG_START_RECT.h)) {
+    commitConfig();
+    difficulty = -1;
+    onlineScreen = 'select';
+  } else if (keyWentDown('r')) {
+    onlineScreen = 'mode';
+  }
+}
+
+// A focusable value box showing the current HP/goal value; click to focus for
+// typing. A focused box is outlined and shows the in-progress digit buffer.
+function drawConfigBox(
+  box: { x: number; y: number; w: number; h: number },
+  value: number,
+  field: 'hp' | 'goal',
+): void {
+  const focused = configFocus === field;
+  fill(focused ? 'rgba(120,200,120,0.30)' : 'rgba(255,255,255,0.10)');
+  rect(box.x, box.y, box.w, box.h);
+  fill('white');
+  textAlign(CENTER, CENTER);
+  textSize(40);
+  const shown = focused && configBuf ? configBuf : String(value);
+  text(shown, box.x + box.w / 2, box.y + box.h / 2);
+  textSize(22);
+  fill('gray');
+  text('custom', box.x + box.w / 2, box.y - 16);
+  if (mouseClickedIn(box.x, box.y, box.w, box.h)) {
+    configFocus = field;
+    configBuf = '';
+  }
+}
+
+// Digit/backspace entry for the focused config box. Clamps to 1–99 and writes
+// straight through to competeHP/competeGoal so the live value tracks typing.
+function handleConfigTyping(): void {
+  if (!configFocus) return;
+  let changed = false;
+  for (let d = 0; d <= 9; d++) {
+    if (keyWentDown(String(d))) {
+      configBuf = (configBuf + d).slice(-2);
+      changed = true;
+    }
+  }
+  if (keyWentDown('backspace')) {
+    configBuf = configBuf.slice(0, -1);
+    changed = true;
+  }
+  if (changed) {
+    const n = configBuf === '' ? 0 : Number.parseInt(configBuf, 10);
+    const clamped = Math.max(1, Math.min(99, n || 1));
+    if (configFocus === 'hp') competeHP = clamped;
+    else competeGoal = clamped;
+  }
+}
+
+// Snap any unfinished typing to a valid value before leaving the config screen.
+function commitConfig(): void {
+  competeHP = Math.max(1, Math.min(99, competeHP || 1));
+  competeGoal = Math.max(1, Math.min(99, competeGoal || 1));
+  configFocus = null;
+  configBuf = '';
+}
+
+// Host difficulty select; on pick, seed and start the configured match.
+function drawHostSelect(): void {
+  drawDifficultySelect();
+  if (difficulty > 0) startMatchHost(true);
 }
 
 // The shared online gameplay tick, run by BOTH clients. The local ship is
@@ -959,14 +1263,17 @@ function drawGameplayOnline(): void {
     remoteShip.y = remoteY;
   }
 
-  // Tell the other client where we are, and how we're moving (for their
-  // dead-reckoning). velocityX/Y were just set from this tick's input above.
+  // Tell the other client where we are, how we're moving (for their
+  // dead-reckoning), and our own counters (the opponent's HUD + compete
+  // arbitration). velocityX/Y were just set from this tick's input above.
   session?.send({
     t: 'pos',
     x: Math.round(localShip.x),
     y: Math.round(localShip.y),
     vx: localShip.velocityX,
     vy: localShip.velocityY,
+    hp: health,
+    coins: points,
   });
 
   // Guest pipes a periodic digest back to the host for the desync log (~2/s).
@@ -995,10 +1302,18 @@ function drawGameplayOnline(): void {
 
   textAlign(LEFT, CENTER);
   textSize(40);
-  fill('red');
-  text(`Health: ${health}`, 600, 40);
-  fill('green');
-  text(`Points: ${points}`, 600, 100);
+  if (matchMode === 'compete') {
+    // Per-player counters: your own (live) and the opponent's (from `pos`).
+    fill('red');
+    text(`You  HP ${health}  ${points}/${winCon}`, 20, 40);
+    fill('aqua');
+    text(`Foe  HP ${oppHealth}  ${oppPoints}/${winCon}`, 20, 100);
+  } else {
+    fill('red');
+    text(`Health: ${health}`, 600, 40);
+    fill('green');
+    text(`Points: ${points}`, 600, 100);
+  }
 
   // Deterministic enemy spawning + cleanup — identical on both via the seed.
   count++;
@@ -1014,13 +1329,72 @@ function drawGameplayOnline(): void {
     }
   }
 
-  // Collision/coin/damage are host-authoritative and must use the RAW received
-  // position, not the smoothed/predicted one (smoothing is render-only).
-  if (isHost) {
+  if (matchMode === 'compete') {
+    // Each client owns its ship: its own wall/enemy hits and its own (never
+    // contested) coin, resolved purely from local state. Crucially this does
+    // NOT destroy the shared seeded blocks, so both clients keep advancing the
+    // identical wave. The host alone decides the win/loss outcome.
+    competeLocalEvents(localShip);
+    if (isHost) competeArbitrate();
+  } else if (isHost) {
+    // Co-op: coins/damage are host-authoritative and must use the RAW received
+    // position, not the smoothed/predicted one (smoothing is render-only).
     remoteShip.x = remoteX;
     remoteShip.y = remoteY;
     hostAuthoritativeEvents(localShip, remoteShip);
+    if (health === 0 || points >= winCon) onlineScreen = 'end';
   }
+}
+
+// Compete, run by BOTH clients each tick: resolve the LOCAL ship's own coin and
+// own damage from local state only. No remote dependency, no host round-trip —
+// each player is authoritative over their own ship. Damage deliberately does
+// not clear `blocks` (the seeded wave is shared and must stay identical on both
+// clients); a short cooldown grants brief post-hit invulnerability instead.
+function competeLocalEvents(localShip: Sprite): void {
+  if (!coinExists) placeCoin(); // own independent coin, Math.random-placed
+  if (localShip.isTouching(coin)) {
+    points++;
+    coinExists = false;
+    coin.y = FIELD + 100;
+  }
+
+  if (damageCooldown > 0) damageCooldown--;
+  if (damageCooldown === 0) {
+    let hit = offField(localShip);
+    if (!hit) {
+      for (const b of blocks) {
+        if (b && localShip.isTouching(b)) {
+          hit = true;
+          break;
+        }
+      }
+    }
+    if (hit) {
+      health--;
+      respawnOwnShip();
+      damageCooldown = 15; // ~0.5 s of invulnerability; blocks are NOT cleared
+    }
+  }
+}
+
+// Host only, compete: decide the match outcome from both players' counters and
+// broadcast it. First to the coin goal wins; dropping to 0 HP loses. The host
+// checks its own state first, which breaks a same-tick tie in its favor.
+function competeArbitrate(): void {
+  if (matchResult) return;
+  let winner: 'host' | 'guest' | null = null;
+  if (points >= winCon) winner = 'host';
+  else if (oppPoints >= winCon) winner = 'guest';
+  else if (health <= 0) winner = 'guest';
+  else if (oppHealth <= 0) winner = 'host';
+  if (!winner) return;
+
+  if (winner === 'host') hostWins++;
+  else guestWins++;
+  matchResult = { winner, hostWins, guestWins };
+  onlineScreen = 'end';
+  session?.send({ t: 'result', winner, hostWins, guestWins });
 }
 
 // Host only: the events that depend on BOTH ships and so can't be derived
@@ -1087,14 +1461,74 @@ function hostRestartToSelect(): void {
   nextSpawn = null;
   for (const b of blocks) b.destroy();
   blocks = [];
-  onlineMatchStarted = false;
   difficulty = -1;
+  onlineScreen = 'select';
   session?.send({ t: 'wait' });
 }
 
 function hostContinue(): void {
   winCon += 25;
   startMatchHost(false); // keep score/health, reseed a fresh wave, resume
+}
+
+// Compete match-end screen, rendered by BOTH ends from the host's `result`.
+// Names the winner from each viewer's perspective and shows the session tally.
+// Only the host can act: C rematches (same settings, tally persists), M returns
+// to mode select.
+function drawMatchEnd(): void {
+  const r = matchResult;
+  if (!r) {
+    // Shouldn't happen, but never strand the screen with no result to show.
+    onlineScreen = 'select';
+    return;
+  }
+  const localIsHost = netRole === 'host';
+  const iWon = (r.winner === 'host') === localIsHost;
+  const myWins = localIsHost ? r.hostWins : r.guestWins;
+  const foeWins = localIsHost ? r.guestWins : r.hostWins;
+
+  background('black');
+  textAlign(CENTER, CENTER);
+  fill(iWon ? 'lightgreen' : 'red');
+  textSize(120);
+  text(iWon ? 'You Win!' : 'You Lose', MID, 250);
+
+  fill('white');
+  textSize(50);
+  text('Match wins', MID, 400);
+  text(`You ${myWins}   —   Foe ${foeWins}`, MID, 470);
+
+  if (localIsHost) {
+    fill('aqua');
+    textSize(38);
+    text('Press C for a rematch', MID, 600);
+    fill('gray');
+    textSize(30);
+    text('Press M to change mode', MID, 660);
+    if (keyWentDown('C')) competeContinue();
+    else if (keyWentDown('m')) competeBackToMenu();
+  } else {
+    fill('gray');
+    textSize(34);
+    text('Waiting for host…', MID, 610);
+  }
+}
+
+// Host: start another compete match with the same settings; the win tally
+// carries over (it's session-only state, untouched here).
+function competeContinue(): void {
+  matchResult = null;
+  startMatchHost(true);
+}
+
+// Host: abandon the current compete settings and return to mode select.
+function competeBackToMenu(): void {
+  matchResult = null;
+  difficulty = -1;
+  onlineScreen = 'mode';
+  for (const b of blocks) b.destroy();
+  blocks = [];
+  session?.send({ t: 'wait' });
 }
 
 function copyLink(link: string): void {
@@ -1174,11 +1608,22 @@ function drawGuest(): void {
     if (keyWentDown('r')) resetToLocalTitle();
     return;
   }
+  // Compete: the host's `result` is the single source of truth for the end — the
+  // guest keeps playing until it lands (its own 0-HP/goal is just a local view).
+  if (matchResult) {
+    drawMatchEnd();
+    return;
+  }
   if (!gameStarted) {
     const msg = netStatus === 'connected' ? 'Waiting for host to start…' : 'Connecting to host…';
     drawCenterMessage(msg, `Room ${roomCode}`);
     return;
   }
+  if (matchMode === 'compete') {
+    drawGameplayOnline();
+    return;
+  }
+  // Co-op overlays are derived from the shared health/points.
   if (health <= 0) {
     drawGuestOverlay('Game Over!', 'red', `Score: ${points}`);
     return;

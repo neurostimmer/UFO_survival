@@ -8,6 +8,7 @@ export {
   encode,
   type NetMessage,
   type PosMsg,
+  type ResultMsg,
   type StartMsg,
   type WaitMsg,
 } from './protocol';
