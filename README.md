@@ -85,9 +85,23 @@ To run the workflow manually (e.g., to redeploy without a code change): Actions 
 
 On the title screen press **O** (or click "host online co-op") to host a game. You'll get a room code and a shareable link — send the link to a friend. When they open it, they join as player 2 over a direct **peer-to-peer WebRTC** connection. Both players use the arrow keys on their own machine.
 
-The netcode is **deterministic**: both players run the same simulation. Enemies are generated locally from a shared seed (so they never travel over the wire), and each player flies their own ship from local input — so **neither player has input lag**. Only each player's position and a few host-decided events that depend on both ships (coin pickups, damage, restarts) cross the wire. Player 1 is the authority for those shared events; if it leaves, the session ends.
+Once connected, the host picks a **mode**:
+
+- **Co-op** — the classic shared game: one shared health/score, both players survive (or lose) together.
+- **Compete** — a race. Each player has their **own** health and coin counter; **first to the coin goal wins**, and dropping to **0 HP loses** (the opponent wins). The host configures the starting **HP** and **coin goal** (presets, or type a custom 1–99 each). When the match ends, a screen names the winner and shows the running **session win tally**; the host can press **C** for a rematch (tally carries over) or **M** to change mode. The tally is session-only — it resets when the host leaves online play.
+
+The netcode is **deterministic**: both players run the same simulation. Enemies are generated locally from a shared seed (so they never travel over the wire), and each player flies their own ship from local input — so **neither player has input lag**. In co-op, the host decides the few events that depend on both ships (coin pickups, damage, restarts). In compete, each player is authoritative for their **own** ship — its wall/enemy hits and its own (never-contested) coin — so ½-RTT can't steal a pickup; the host arbitrates only the win/loss **outcome** so the two ends can't disagree. Compete damage deliberately does **not** clear the shared enemy wave, keeping both clients' fields identical. Player 1 is the session authority either way; if it leaves, the session ends.
 
 Connections are brokered by a Cloudflare Worker + Durable Object (`worker/`) that does WebRTC signaling only — once the peers are connected, gameplay traffic never touches the server. The signaling backend lives at the **same origin** as the game, so online co-op requires the app to be served from the Worker (`npm run cf:deploy`, or `npm run cf:dev` locally) rather than from GitHub Pages. ICE uses public STUN with no TURN, so a pair behind two symmetric NATs may fail to connect.
+
+**URL flags (per client, opt-in):**
+
+| Flag | Effect |
+| --- | --- |
+| `?smooth=1` | Smooths the *other* player's ship: dead-reckons it forward by its last sent velocity and eases the drawn position toward that prediction (exponential smoothing), hiding the ½-RTT lag and dropped-packet jitter. Render-only — the host still collides on the raw received position. No flag = the ship snaps to its raw position. |
+| `?debug=1` | On the **host** only: shows a running desync log under the canvas comparing the host's sim against the guest's (piped over the data channel) — enemy-stream seed match, coin match, and tick drift. |
+
+Each flag is read independently per page load, so a host can combine them (`?smooth=1&debug=1`) and a guest can add `&smooth=1` to their `?join=` link.
 
 > **Deploy note (Durable Objects):** deploy the Worker with `wrangler deploy` (what `npm run cf:deploy` runs). `wrangler versions upload` **cannot** apply a Durable Object migration and fails with error 10211 — so if your Cloudflare build pipeline's deploy command is `wrangler versions upload`, change it to `wrangler deploy`, or apply the migration once locally with `npm run cf:deploy`.
 

@@ -77,11 +77,10 @@ let session: Session | null = null;
 // The other player's most recent ship position (host sees the guest's, guest
 // sees the host's). Applied directly so the host's collision checks use the
 // real position, not a smoothed one.
-let remoteX = 200;
-let remoteY = 200;
-// Host: whether the current match's `start` has been sent. Guest: whether a
-// `start` has been received (gates the gameplay screen vs the waiting screen).
-let onlineMatchStarted = false;
+let remoteX = 400; // field-center default until the first pos arrives
+let remoteY = 400;
+// Guest: whether a `start` has been received (gates the gameplay screen vs the
+// waiting screen). The host's equivalent is the explicit `onlineScreen` flow.
 let gameStarted = false;
 // Host-only: suppresses repeat damage from a networked off-field ship for a few
 // ticks (the host can't force the remote ship back on-field; the guest's own
@@ -106,6 +105,70 @@ function resetDiag(): void {
   hostSpawns.length = 0;
 }
 
+// Remote-ship smoothing (?smooth=1, read per-client in init()). Off → the remote
+// ship snaps to its raw received position (current behavior). On → dead-reckon
+// it forward by its last sent velocity and ease the DRAWN position toward that
+// prediction, hiding ½-RTT lag and dropped-packet jitter. Render-only: the host
+// still collides on the raw position. See the netcode notes in CLAUDE.md.
+let remoteSmoothing = false;
+let predX = 400; // dead-reckon anchor: last received pos, advanced each tick
+let predY = 400;
+let predVX = 0; // last received velocity
+let predVY = 0;
+let predStale = 0; // ticks since the last pos update (caps runaway extrapolation)
+let dispX = 400; // smoothed position actually drawn
+let dispY = 400;
+const REMOTE_SMOOTH = 0.5; // exponential-smoothing factor toward the prediction
+const PREDICT_CAP = 10; // stop extrapolating after this many tickless updates (~⅓ s)
+
+// Re-anchor the smoother at a (re)start so it doesn't slide in from a stale spot.
+function resetRemoteSmoothing(): void {
+  predX = dispX = remoteX;
+  predY = dispY = remoteY;
+  predVX = predVY = 0;
+  predStale = 0;
+}
+
+// --- Competitive online play -----------------------------------------------
+// Compete differs from co-op in three places: HP and coins are PER-PLAYER (not
+// shared); each client is self-authoritative for its OWN ship (its own wall/
+// enemy hits and its own independent coin — coins are never contested, so ½-RTT
+// can't steal one); and damage does NOT wipe the shared seeded enemy field, so
+// both clients keep advancing the identical wave. The host arbitrates only the
+// win/loss OUTCOME (first to the coin goal wins; 0 HP loses) so the two ends
+// can't disagree. `matchMode` is set from the `start` event on the guest and
+// from the mode-select screen on the host.
+type MatchMode = 'coop' | 'compete';
+let matchMode: MatchMode = 'coop';
+// The opponent's own counters, received via `pos`. Only read in compete (drawn
+// as the "Foe" HUD; the host arbitrates win/loss from them).
+let oppHealth = 10;
+let oppPoints = 0;
+// Session-only win tally (lives on the host; broadcast in `result`). Never
+// persisted across sessions — reset only in resetToLocalTitle().
+let hostWins = 0;
+let guestWins = 0;
+// Set once the host decides the outcome (and on the guest when `result` lands);
+// drives the match-end screen on both ends. Cleared at the next match start.
+let matchResult: { winner: 'host' | 'guest'; hostWins: number; guestWins: number } | null = null;
+
+// Host-chosen compete settings (the config screen). Starting HP and coin goal,
+// each an integer 1–99.
+let competeHP = 10;
+let competeGoal = 25;
+
+// Host online screen flow (only meaningful while netRole === 'host'). The guest
+// has no menus — it follows the host's `start`/`wait`/`result` events.
+//   lobby is handled separately by netStatus; from 'connected' the host walks
+//   mode → (config, compete only) → select → play → end.
+type OnlineScreen = 'mode' | 'config' | 'select' | 'play' | 'end';
+let onlineScreen: OnlineScreen = 'mode';
+
+// Compete-config keyboard entry: which field a typed digit edits, and the
+// in-progress digit buffer for it. null = no field focused (presets only).
+let configFocus: 'hp' | 'goal' | null = null;
+let configBuf = '';
+
 const shipAnimations: string[] = [];
 for (let i = 1; i <= 21; i++) {
   shipAnimations.push(i < 10 ? `retroship_0${i}_1` : `retroship_${i}_1`);
@@ -125,7 +188,22 @@ let enemyIcon: Sprite | null = null;
 type SpawnTarget = { direction: 1 | 2 | 3 | 4; x: number; y: number };
 let nextSpawn: SpawnTarget | null = null;
 
-const FIELD = 400;
+// Play-field geometry. The field doubled from the original 400 → 800; the
+// movement dynamics below double with it so the FEEL is identical on the bigger
+// axis (same jump-height fraction, traversal time, threat density). Entity
+// sprite scales and the spawn-indicator effect sizes are deliberately NOT
+// scaled — on the bigger field they read as smaller, finer-grained targets.
+const FIELD = 800;
+const MID = FIELD / 2; // field center — ship spawn / respawn point
+const EDGE = 10; // spawn + cleanup margin just outside the field (block-sized; unscaled)
+const COIN_INSET = 50; // coin keep-off-the-walls inset (coin sprite size unchanged; unscaled)
+
+const SHIP_JUMP = -24; // jump impulse (was -12)
+const SHIP_SPEED = 10; // horizontal speed (was 5)
+const GRAVITY = 3; // per-tick downward accel (was 1.5)
+const RESPAWN_IMPULSE = -30; // upward kick on respawn (was -15)
+const BLOCK_SPEED = 10; // enemy travel speed (was 5)
+
 // Gaussian indicator. The marker is a 2D radial Gaussian anchored at the
 // wall-coord nearest the spawn point — the half outside the canvas is
 // naturally clipped, so what's visible is the "edge-bright, fades into the
@@ -140,26 +218,28 @@ const ALPHA_PEAK_INITIAL = 0.5;
 const ALPHA_PEAK_FINAL = 1.0;
 const GAUSSIAN_RADIUS_SIGMAS = 3; // outer gradient radius in σ units (~99.7%)
 
-// Mouse hit-rects for menu items. Coords are logical canvas pixels (400×400).
-const TITLE_1P_RECT = { x: 60, y: 318, w: 290, h: 22 };
-const TITLE_2P_RECT = { x: 40, y: 340, w: 320, h: 22 };
-const DIFF_EASY_RECT = { x: 90, y: 135, w: 200, h: 30 };
-const DIFF_NORMAL_RECT = { x: 90, y: 185, w: 230, h: 30 };
-const DIFF_HARD_RECT = { x: 90, y: 235, w: 200, h: 30 };
+// Mouse hit-rects for menu items. Coords are logical canvas pixels (800×800).
+const TITLE_1P_RECT = { x: 120, y: 636, w: 580, h: 44 };
+const TITLE_2P_RECT = { x: 80, y: 680, w: 640, h: 44 };
+const DIFF_EASY_RECT = { x: 180, y: 270, w: 400, h: 60 };
+const DIFF_NORMAL_RECT = { x: 180, y: 370, w: 460, h: 60 };
+const DIFF_HARD_RECT = { x: 180, y: 470, w: 400, h: 60 };
 const HOVER_BG = 'rgba(255, 255, 255, 0.12)';
 
-// Title "host online" entry + lobby copy-button hit-rects (logical 400×400 px).
-const TITLE_HOST_RECT = { x: 40, y: 362, w: 340, h: 22 };
-const COPY_RECT = { x: 80, y: 215, w: 240, h: 28 };
+// Title "host online" entry + lobby copy-button hit-rects (logical 800×800 px).
+const TITLE_HOST_RECT = { x: 80, y: 724, w: 680, h: 44 };
+const COPY_RECT = { x: 160, y: 430, w: 480, h: 56 };
 
 export function init(): void {
-  backGround = createSprite(200, 200, 400, 400);
+  backGround = createSprite(MID, MID, FIELD, FIELD);
   backGround.setAnimation('space_1');
+  // space_1 is now native 800² art (scripts/gen_background.py), so it covers the
+  // field at scale 1 — no stretch.
   // PARITY: original passes 0.1 as both width and height — nonsensical, but
   // setAnimation immediately overrides those with the loaded image's natural
   // size, so the values never matter.
-  UFO1 = createSprite(100, 200, 0.1, 0.1);
-  UFO2 = createSprite(100, 200, 0.1, 0.1);
+  UFO1 = createSprite(200, MID, 0.1, 0.1);
+  UFO2 = createSprite(200, MID, 0.1, 0.1);
   UFO1.scale = 0.1;
   UFO2.scale = 0.1;
   coin = createSprite(-100, -100);
@@ -167,6 +247,9 @@ export function init(): void {
   // Music. The audio shim queues this until the first user gesture unlocks
   // the AudioContext (Chromium autoplay policy).
   playSound('sound://category_music/clear_evidence_loop1.mp3', true);
+
+  // ?smooth=1 opts this client into remote-ship dead-reckoning + smoothing.
+  remoteSmoothing = new URLSearchParams(location.search).get('smooth') === '1';
 
   // If this page was opened from a host's share link, jump straight into
   // joining as the guest — the title/menu never shows for player two.
@@ -201,18 +284,18 @@ function drawGameplay(): void {
   UFO1.setAnimation('ufo_1');
   UFO2.setAnimation('ufo_2');
 
-  if (keyWentDown('up')) UFO1.velocityY = -12;
-  if (keyWentDown('w')) UFO2.velocityY = -12;
+  if (keyWentDown('up')) UFO1.velocityY = SHIP_JUMP;
+  if (keyWentDown('w')) UFO2.velocityY = SHIP_JUMP;
 
   UFO1.velocityX = 0;
   UFO2.velocityX = 0;
-  if (keyDown('left')) UFO1.velocityX = -5;
-  if (keyDown('right')) UFO1.velocityX = 5;
-  if (keyDown('a')) UFO2.velocityX = -5;
-  if (keyDown('d')) UFO2.velocityX = 5;
+  if (keyDown('left')) UFO1.velocityX = -SHIP_SPEED;
+  if (keyDown('right')) UFO1.velocityX = SHIP_SPEED;
+  if (keyDown('a')) UFO2.velocityX = -SHIP_SPEED;
+  if (keyDown('d')) UFO2.velocityX = SHIP_SPEED;
 
-  UFO2.velocityY += 1.5;
-  UFO1.velocityY += 1.5;
+  UFO2.velocityY += GRAVITY;
+  UFO1.velocityY += GRAVITY;
 
   // Draw order: background → indicator (under sprites so the player can fly
   // over it) → all other sprites → HUD. drawSprites() would redraw the
@@ -225,11 +308,11 @@ function drawGameplay(): void {
   drawSprite(coin);
   for (const b of blocks) drawSprite(b);
 
-  textSize(20);
+  textSize(40);
   fill('red');
-  text(`Health: ${health}`, 300, 20);
+  text(`Health: ${health}`, 600, 40);
   fill('green');
-  text(`Points: ${points}`, 300, 50);
+  text(`Points: ${points}`, 600, 100);
 
   count++;
 
@@ -241,8 +324,8 @@ function drawGameplay(): void {
 
   if (!coinExists) {
     coin.setAnimation('coin');
-    coin.y = randomNumber(50, 350);
-    coin.x = randomNumber(50, 350);
+    coin.y = randomNumber(COIN_INSET, FIELD - COIN_INSET);
+    coin.x = randomNumber(COIN_INSET, FIELD - COIN_INSET);
     coinExists = true;
     coin.scale = 0.4;
   }
@@ -250,7 +333,7 @@ function drawGameplay(): void {
   if (UFO1.isTouching(coin) || (UFO2.isTouching(coin) && players === 3)) {
     points++;
     coinExists = false;
-    coin.y = 500;
+    coin.y = FIELD + 100;
   }
 
   //Fixed an issue where offscreened blocks were only cleared when going downward
@@ -258,7 +341,10 @@ function drawGameplay(): void {
     const currentBlock = blocks[i];
     if (
       currentBlock &&
-      (currentBlock.x < -10 || currentBlock.x > 410 || currentBlock.y < -10 || currentBlock.y > 410)
+      (currentBlock.x < -EDGE ||
+        currentBlock.x > FIELD + EDGE ||
+        currentBlock.y < -EDGE ||
+        currentBlock.y > FIELD + EDGE)
     ) {
       currentBlock.destroy();
       blocks.splice(i, 1);
@@ -266,10 +352,10 @@ function drawGameplay(): void {
   }
 
   // Wall damage. P1 always; P2 only in 2P (`players === 3`).
-  if (UFO1.y < 0 || UFO1.y > 400 || UFO1.x < 0 || UFO1.x > 400) {
+  if (UFO1.y < 0 || UFO1.y > FIELD || UFO1.x < 0 || UFO1.x > FIELD) {
     handleDamage();
   }
-  if ((UFO2.y < 0 || UFO2.y > 400 || UFO2.x < 0 || UFO2.x > 400) && players === 3) {
+  if ((UFO2.y < 0 || UFO2.y > FIELD || UFO2.x < 0 || UFO2.x > FIELD) && players === 3) {
     handleDamage();
   }
 
@@ -293,17 +379,17 @@ function decideNextSpawn(): void {
   let x = 0;
   let y = 0;
   if (direction === 1) {
-    x = 410;
-    y = randomNumber(10, 390);
+    x = FIELD + EDGE;
+    y = randomNumber(EDGE, FIELD - EDGE);
   } else if (direction === 2) {
-    x = randomNumber(10, 390);
-    y = 410;
+    x = randomNumber(EDGE, FIELD - EDGE);
+    y = FIELD + EDGE;
   } else if (direction === 3) {
-    x = -10;
-    y = randomNumber(10, 390);
+    x = -EDGE;
+    y = randomNumber(EDGE, FIELD - EDGE);
   } else {
-    x = randomNumber(10, 390);
-    y = -10;
+    x = randomNumber(EDGE, FIELD - EDGE);
+    y = -EDGE;
   }
   nextSpawn = { direction, x, y };
 }
@@ -315,10 +401,10 @@ function spawnBlock(): void {
   const newBlock = createSprite(target.x, target.y);
   newBlock.direction = target.direction;
   newBlock.scale = 0.2;
-  if (target.direction === 1) newBlock.velocityX = -5;
-  else if (target.direction === 2) newBlock.velocityY = -5;
-  else if (target.direction === 3) newBlock.velocityX = 5;
-  else newBlock.velocityY = 5;
+  if (target.direction === 1) newBlock.velocityX = -BLOCK_SPEED;
+  else if (target.direction === 2) newBlock.velocityY = -BLOCK_SPEED;
+  else if (target.direction === 3) newBlock.velocityX = BLOCK_SPEED;
+  else newBlock.velocityY = BLOCK_SPEED;
 
   const randomIndex = randomNumber(0, shipAnimations.length - 1);
   const name = shipAnimations[randomIndex];
@@ -417,11 +503,11 @@ function drawNonGameplay(): void {
     // PARITY: original sets health = 11 (one extra HP after restart).
     health = 11;
     points = 0;
-    UFO1.y = 600;
+    UFO1.y = FIELD + 400;
     UFO1.velocityY = 0;
     UFO1.velocityX = 0;
     if (players > 2) {
-      UFO2.y = 600;
+      UFO2.y = FIELD + 400;
       UFO2.velocityY = 0;
       UFO2.velocityX = 0;
     }
@@ -437,23 +523,24 @@ function drawNonGameplay(): void {
 function drawGameOver(): void {
   background('black');
   fill('red');
-  textSize(70);
+  textSize(140);
   textAlign(CENTER, CENTER);
-  text('Game Over!', 200, 150);
-  textSize(20);
-  text(`Your score: ${points}`, 200, 250);
-  // PARITY: original has x = 199 (typo — every other label uses 200).
-  text('press R to restart', 199, 300);
+  text('Game Over!', MID, 300);
+  textSize(40);
+  text(`Your score: ${points}`, MID, 500);
+  // PARITY: original has x = 199 (typo — every other label uses 200), preserved
+  // here doubled (398) for fidelity to the off-by-one.
+  text('press R to restart', 398, 600);
 }
 
 function drawWin(): void {
   fill('green');
-  textSize(70);
+  textSize(140);
   textAlign(CENTER, CENTER);
-  text('You Win!', 200, 150);
-  textSize(20);
-  text(`Final Health: ${health}`, 200, 250);
-  text('press C to keep going!', 200, 275);
+  text('You Win!', MID, 300);
+  textSize(40);
+  text(`Final Health: ${health}`, MID, 500);
+  text('press C to keep going!', MID, 550);
   // PARITY: original is keyWentDown("C") with literal uppercase. The input
   // shim lowercases internally so this matches both shifted and unshifted C.
   if (keyWentDown('C')) {
@@ -468,33 +555,33 @@ function drawDifficultySelect(): void {
   backGround.setAnimation('space_1');
   fill('white');
   drawSprites();
-  textSize(50);
-  text('Select difficulty:', 20, 100);
-  textSize(20);
+  textSize(100);
+  text('Select difficulty:', 40, 200);
+  textSize(40);
 
   if (mouseOver(DIFF_EASY_RECT.x, DIFF_EASY_RECT.y, DIFF_EASY_RECT.w, DIFF_EASY_RECT.h)) {
     fill(HOVER_BG);
     rect(DIFF_EASY_RECT.x, DIFF_EASY_RECT.y, DIFF_EASY_RECT.w, DIFF_EASY_RECT.h);
   }
   fill('green');
-  text('press 1 for easy', 100, 150);
+  text('press 1 for easy', 200, 300);
 
   if (mouseOver(DIFF_NORMAL_RECT.x, DIFF_NORMAL_RECT.y, DIFF_NORMAL_RECT.w, DIFF_NORMAL_RECT.h)) {
     fill(HOVER_BG);
     rect(DIFF_NORMAL_RECT.x, DIFF_NORMAL_RECT.y, DIFF_NORMAL_RECT.w, DIFF_NORMAL_RECT.h);
   }
   fill('yellow');
-  text('press 2 for normal', 100, 200);
+  text('press 2 for normal', 200, 400);
 
   if (mouseOver(DIFF_HARD_RECT.x, DIFF_HARD_RECT.y, DIFF_HARD_RECT.w, DIFF_HARD_RECT.h)) {
     fill(HOVER_BG);
     rect(DIFF_HARD_RECT.x, DIFF_HARD_RECT.y, DIFF_HARD_RECT.w, DIFF_HARD_RECT.h);
   }
   fill('red');
-  text('press 3 for hard', 100, 250);
+  text('press 3 for hard', 200, 500);
 
-  textSize(15);
-  text('Game designed and coded by Hyrum Adams', 50, 300);
+  textSize(30);
+  text('Game designed and coded by Hyrum Adams', 100, 600);
   if (players === 1) {
     // PARITY: 1P mode parks UFO2 far offscreen so drawSprites doesn't render it.
     UFO2.y = 10000;
@@ -519,65 +606,65 @@ function drawDifficultySelect(): void {
 function drawTitle(): void {
   background('black');
   textAlign(LEFT, TOP);
-  textSize(40);
+  textSize(80);
   fill('white');
-  text('🚀 UFO Survival', 60, 30);
+  text('🚀 UFO Survival', 120, 60);
 
   if (!UFOIcon) {
-    UFOIcon = createSprite(50, 160);
+    UFOIcon = createSprite(100, 320);
     UFOIcon.setAnimation('ufo_1');
     UFOIcon.scale = 0.08;
   }
   if (!UFO2Icon) {
-    UFO2Icon = createSprite(50, 190);
+    UFO2Icon = createSprite(100, 380);
     UFO2Icon.setAnimation('ufo_2');
     UFO2Icon.scale = 0.08;
   }
   if (!coinIcon) {
-    coinIcon = createSprite(50, 250);
+    coinIcon = createSprite(100, 500);
     coinIcon.setAnimation('coin');
     coinIcon.scale = 0.4;
   }
   if (!enemyIcon) {
-    enemyIcon = createSprite(50, 220);
+    enemyIcon = createSprite(100, 440);
     enemyIcon.setAnimation('retroship_02_1');
     enemyIcon.scale = 0.08;
   }
 
-  textSize(20);
+  textSize(40);
   fill('lightblue');
-  text('Controls:', 50, 120);
+  text('Controls:', 100, 240);
   fill('white');
-  text('- Arrow keys to move (1st player)', 70, 150);
-  text('- Use WASD to move (2nd player)', 70, 180);
-  text('- Avoid enemy ships!', 70, 210);
-  text('- Collect coins for points', 70, 240);
-  text('- If your health reaches 0, you lose.', 70, 270);
+  text('- Arrow keys to move (1st player)', 140, 300);
+  text('- Use WASD to move (2nd player)', 140, 360);
+  text('- Avoid enemy ships!', 140, 420);
+  text('- Collect coins for points', 140, 480);
+  text('- If your health reaches 0, you lose.', 140, 540);
 
   fill('yellow');
-  text(`Goal: Get ${winCon} points to win!`, 60, 296);
+  text(`Goal: Get ${winCon} points to win!`, 120, 592);
 
-  textSize(18);
+  textSize(36);
   if (mouseOver(TITLE_1P_RECT.x, TITLE_1P_RECT.y, TITLE_1P_RECT.w, TITLE_1P_RECT.h)) {
     fill(HOVER_BG);
     rect(TITLE_1P_RECT.x, TITLE_1P_RECT.y, TITLE_1P_RECT.w, TITLE_1P_RECT.h);
   }
   fill('orange');
-  text('Press SPACE for one player', 70, 322);
+  text('Press SPACE for one player', 140, 644);
 
   if (mouseOver(TITLE_2P_RECT.x, TITLE_2P_RECT.y, TITLE_2P_RECT.w, TITLE_2P_RECT.h)) {
     fill(HOVER_BG);
     rect(TITLE_2P_RECT.x, TITLE_2P_RECT.y, TITLE_2P_RECT.w, TITLE_2P_RECT.h);
   }
   fill('orange');
-  text('Press BACKSPACE for two player!', 50, 344);
+  text('Press BACKSPACE for two player!', 100, 688);
 
   if (mouseOver(TITLE_HOST_RECT.x, TITLE_HOST_RECT.y, TITLE_HOST_RECT.w, TITLE_HOST_RECT.h)) {
     fill(HOVER_BG);
     rect(TITLE_HOST_RECT.x, TITLE_HOST_RECT.y, TITLE_HOST_RECT.w, TITLE_HOST_RECT.h);
   }
   fill('aqua');
-  text('Press O to host online co-op', 50, 366);
+  text('Press O to host online co-op', 100, 732);
 
   // Capture locals after lazy-init so TS narrowing survives across the
   // remaining draw/destroy calls.
@@ -628,13 +715,13 @@ function drawTitle(): void {
 
 function handleDamage(): void {
   health--;
-  UFO1.y = 200;
-  UFO1.x = 200;
-  UFO1.velocityY = -15;
+  UFO1.y = MID;
+  UFO1.x = MID;
+  UFO1.velocityY = RESPAWN_IMPULSE;
   if (players > 2) {
-    UFO2.y = 200;
-    UFO2.x = 200;
-    UFO2.velocityY = -15;
+    UFO2.y = MID;
+    UFO2.x = MID;
+    UFO2.velocityY = RESPAWN_IMPULSE;
   }
   background(rgb(255, 0, 0, 0.5));
   for (const b of blocks) b.destroy();
@@ -648,8 +735,8 @@ function startHosting(): void {
   netStatus = 'waiting';
   roomCode = makeRoomCode();
   players = 3; // two ships active
-  difficulty = -1; // once a guest connects, the host lands on difficulty select
-  onlineMatchStarted = false;
+  difficulty = -1;
+  onlineScreen = 'mode'; // once a guest connects, the host picks co-op vs compete
   session = hostSession(roomCode, {
     onMessage: onNetMessage,
     onConnected: () => {
@@ -684,10 +771,10 @@ function resetToLocalTitle(): void {
   netRole = 'local';
   netStatus = 'idle';
   roomCode = '';
-  onlineMatchStarted = false;
   gameStarted = false;
   damageCooldown = 0;
   resetDiag();
+  resetRemoteSmoothing();
   for (const b of blocks) b.destroy();
   blocks = [];
   players = 1;
@@ -698,6 +785,18 @@ function resetToLocalTitle(): void {
   coinExists = false;
   nextSpawn = null;
   difficulty = -2;
+  // Compete state is session-scoped — reset it all when leaving online play.
+  matchMode = 'coop';
+  oppHealth = 10;
+  oppPoints = 0;
+  hostWins = 0;
+  guestWins = 0;
+  matchResult = null;
+  onlineScreen = 'mode';
+  competeHP = 10;
+  competeGoal = 25;
+  configFocus = null;
+  configBuf = '';
   setRandomSeed(null); // restore non-deterministic local play
 }
 
@@ -708,22 +807,22 @@ function ownShip(): Sprite {
 
 function respawnOwnShip(): void {
   const s = ownShip();
-  s.x = 200;
-  s.y = 200;
+  s.x = MID;
+  s.y = MID;
   s.velocityX = 0;
-  s.velocityY = -15;
+  s.velocityY = RESPAWN_IMPULSE;
 }
 
 function offField(s: Sprite): boolean {
-  return s.x < 0 || s.x > 400 || s.y < 0 || s.y > 400;
+  return s.x < 0 || s.x > FIELD || s.y < 0 || s.y > FIELD;
 }
 
 // Coins are host-authoritative (who grabs one depends on both ships), so the
 // host picks positions from Math.random — NOT the seeded RNG — to keep the
 // shared enemy stream byte-identical on both clients.
 function placeCoin(): void {
-  coin.x = Math.round(50 + Math.random() * 300);
-  coin.y = Math.round(50 + Math.random() * 300);
+  coin.x = Math.round(COIN_INSET + Math.random() * (FIELD - 2 * COIN_INSET));
+  coin.y = Math.round(COIN_INSET + Math.random() * (FIELD - 2 * COIN_INSET));
   coinExists = true;
 }
 
@@ -734,23 +833,46 @@ function onNetMessage(msg: NetMessage): void {
     case 'pos':
       remoteX = msg.x;
       remoteY = msg.y;
+      // Opponent's own counters (compete HUD + host win/loss arbitration).
+      oppHealth = msg.hp;
+      oppPoints = msg.coins;
+      // Re-anchor the dead-reckoner on each authoritative sample (used only when
+      // ?smooth=1; harmless otherwise).
+      predX = msg.x;
+      predY = msg.y;
+      predVX = msg.vx;
+      predVY = msg.vy;
+      predStale = 0;
       break;
     case 'start':
+      matchMode = msg.mode;
       setRandomSeed(msg.seed);
       difficulty = msg.difficulty;
       health = msg.health;
       points = msg.points;
       winCon = msg.winCon;
+      oppHealth = msg.health; // both sides start equal
+      oppPoints = msg.points;
       count = 0;
       nextSpawn = null;
       damageCooldown = 0;
+      matchResult = null;
       resetDiag();
+      resetRemoteSmoothing();
       for (const b of blocks) b.destroy();
       blocks = [];
-      coin.x = msg.coinX;
-      coin.y = msg.coinY;
-      coinExists = true;
+      if (msg.mode === 'compete') {
+        // Each client runs its OWN coin locally; force a fresh local placement.
+        coinExists = false;
+      } else {
+        coin.x = msg.coinX;
+        coin.y = msg.coinY;
+        coinExists = true;
+      }
       gameStarted = true;
+      break;
+    case 'result':
+      matchResult = { winner: msg.winner, hostWins: msg.hostWins, guestWins: msg.guestWins };
       break;
     case 'coin':
       points = msg.points;
@@ -766,6 +888,7 @@ function onNetMessage(msg: NetMessage): void {
       break;
     case 'wait':
       gameStarted = false;
+      matchResult = null;
       break;
     case 'diag':
       if (netRole === 'host' && debugEnabled()) showDiag(msg);
@@ -810,22 +933,37 @@ function showDiag(g: DiagMsg): void {
 // match; a win-continue keeps them and just reseeds the enemy wave.
 function startMatchHost(fresh: boolean): void {
   if (fresh) {
-    health = 10;
-    points = 0;
-    winCon = 25;
+    if (matchMode === 'compete') {
+      health = competeHP;
+      points = 0;
+      winCon = competeGoal;
+      oppHealth = competeHP;
+      oppPoints = 0;
+    } else {
+      health = 10;
+      points = 0;
+      winCon = 25;
+    }
   }
+  matchResult = null;
   const seed = Math.floor(Math.random() * 0x7fffffff);
   setRandomSeed(seed);
   count = 0;
   nextSpawn = null;
   damageCooldown = 0;
   resetDiag();
+  resetRemoteSmoothing();
   for (const b of blocks) b.destroy();
   blocks = [];
-  placeCoin();
-  onlineMatchStarted = true;
+  if (matchMode === 'compete') {
+    coinExists = false; // each client places its own coin on the first tick
+  } else {
+    placeCoin();
+  }
+  onlineScreen = 'play';
   session?.send({
     t: 'start',
+    mode: matchMode,
     seed,
     difficulty,
     health,
@@ -841,16 +979,241 @@ function drawHost(): void {
     drawHostLobby();
     return;
   }
-  const playing = health > 0 && points < winCon && difficulty > 0;
-  if (playing) {
-    if (!onlineMatchStarted) startMatchHost(true);
-    drawGameplayOnline();
-    return;
+  // Once a guest is connected the host walks an explicit screen flow:
+  // mode → (config, compete only) → difficulty select → play → match end.
+  switch (onlineScreen) {
+    case 'mode':
+      drawModeSelect();
+      return;
+    case 'config':
+      drawCompeteConfig();
+      return;
+    case 'select':
+      drawHostSelect();
+      return;
+    case 'play':
+      drawGameplayOnline();
+      return;
+    case 'end':
+      if (matchMode === 'compete') drawMatchEnd();
+      else drawOnlineMenus();
+      return;
   }
-  // Leaving gameplay (to select, or on game over) clears the match flag so the
-  // next entry seeds a fresh world; a win keeps it (the continue reseeds).
-  if (difficulty <= 0 || health === 0) onlineMatchStarted = false;
-  drawOnlineMenus();
+}
+
+// Host: choose co-op vs compete once a guest has connected. Keyboard 1/2 or
+// click. Co-op jumps straight to difficulty select; compete inserts the config
+// screen first.
+const MODE_COOP_RECT = { x: 200, y: 320, w: 400, h: 70 };
+const MODE_COMPETE_RECT = { x: 200, y: 440, w: 400, h: 70 };
+
+function drawModeSelect(): void {
+  background('black');
+  textAlign(CENTER, CENTER);
+  fill('white');
+  textSize(70);
+  text('Choose mode', MID, 160);
+
+  drawMenuButton(MODE_COOP_RECT, '1  ·  Co-op', 'lightgreen');
+  drawMenuButton(MODE_COMPETE_RECT, '2  ·  Compete', 'orange');
+
+  textSize(26);
+  fill('gray');
+  text('Co-op: shared survival.   Compete: first to the coin goal wins.', MID, 560);
+  text('Press R to cancel', MID, 700);
+
+  const wantCoop =
+    keyWentDown('1') ||
+    mouseClickedIn(MODE_COOP_RECT.x, MODE_COOP_RECT.y, MODE_COOP_RECT.w, MODE_COOP_RECT.h);
+  const wantCompete =
+    keyWentDown('2') ||
+    mouseClickedIn(
+      MODE_COMPETE_RECT.x,
+      MODE_COMPETE_RECT.y,
+      MODE_COMPETE_RECT.w,
+      MODE_COMPETE_RECT.h,
+    );
+
+  if (wantCoop) {
+    matchMode = 'coop';
+    difficulty = -1;
+    onlineScreen = 'select';
+  } else if (wantCompete) {
+    matchMode = 'compete';
+    onlineScreen = 'config';
+  } else if (keyWentDown('r')) {
+    resetToLocalTitle();
+  }
+}
+
+// A simple filled menu button with hover highlight + centered label. Used by the
+// online host menus. `rect` here is {x,y,w,h} in logical 800² px.
+function drawMenuButton(
+  r: { x: number; y: number; w: number; h: number },
+  label: string,
+  color: string,
+): void {
+  const hot = mouseOver(r.x, r.y, r.w, r.h);
+  fill(hot ? 'rgba(255,255,255,0.18)' : 'rgba(255,255,255,0.06)');
+  rect(r.x, r.y, r.w, r.h);
+  fill(color);
+  textSize(40);
+  textAlign(CENTER, CENTER);
+  text(label, r.x + r.w / 2, r.y + r.h / 2);
+}
+
+// Host compete config: pick starting HP and coin goal. Each field has three
+// presets plus a click-to-focus value box you can type a custom 1–99 into.
+const CFG_HP_PRESETS = [5, 10, 20];
+const CFG_GOAL_PRESETS = [10, 25, 50];
+const CFG_HP_BOX = { x: 560, y: 250, w: 150, h: 64 };
+const CFG_GOAL_BOX = { x: 560, y: 410, w: 150, h: 64 };
+const CFG_START_RECT = { x: 250, y: 600, w: 300, h: 72 };
+
+function presetRect(row: number, i: number): { x: number; y: number; w: number; h: number } {
+  return { x: 90 + i * 150, y: row, w: 130, h: 64 };
+}
+
+function drawCompeteConfig(): void {
+  background('black');
+  textAlign(CENTER, CENTER);
+  fill('white');
+  textSize(56);
+  text('Compete setup', MID, 110);
+
+  // --- Health row ---
+  fill('white');
+  textSize(36);
+  textAlign(LEFT, CENTER);
+  text('Health', 90, 215);
+  CFG_HP_PRESETS.forEach((v, i) => {
+    const r = presetRect(250, i);
+    const sel = competeHP === v && configFocus !== 'hp';
+    fill(
+      mouseOver(r.x, r.y, r.w, r.h)
+        ? 'rgba(255,255,255,0.18)'
+        : sel
+          ? 'rgba(120,200,120,0.30)'
+          : 'rgba(255,255,255,0.06)',
+    );
+    rect(r.x, r.y, r.w, r.h);
+    fill('white');
+    textAlign(CENTER, CENTER);
+    textSize(38);
+    text(String(v), r.x + r.w / 2, r.y + r.h / 2);
+    if (mouseClickedIn(r.x, r.y, r.w, r.h)) {
+      competeHP = v;
+      configFocus = null;
+      configBuf = '';
+    }
+  });
+  drawConfigBox(CFG_HP_BOX, competeHP, 'hp');
+
+  // --- Coin-goal row ---
+  fill('white');
+  textSize(36);
+  textAlign(LEFT, CENTER);
+  text('Coin goal', 90, 375);
+  CFG_GOAL_PRESETS.forEach((v, i) => {
+    const r = presetRect(410, i);
+    const sel = competeGoal === v && configFocus !== 'goal';
+    fill(
+      mouseOver(r.x, r.y, r.w, r.h)
+        ? 'rgba(255,255,255,0.18)'
+        : sel
+          ? 'rgba(120,200,120,0.30)'
+          : 'rgba(255,255,255,0.06)',
+    );
+    rect(r.x, r.y, r.w, r.h);
+    fill('white');
+    textAlign(CENTER, CENTER);
+    textSize(38);
+    text(String(v), r.x + r.w / 2, r.y + r.h / 2);
+    if (mouseClickedIn(r.x, r.y, r.w, r.h)) {
+      competeGoal = v;
+      configFocus = null;
+      configBuf = '';
+    }
+  });
+  drawConfigBox(CFG_GOAL_BOX, competeGoal, 'goal');
+
+  // --- Start ---
+  drawMenuButton(CFG_START_RECT, 'Start match', 'lightgreen');
+  textAlign(CENTER, CENTER);
+  fill('gray');
+  textSize(24);
+  text('Click a value box, then type 1–99.   R to cancel.', MID, 710);
+
+  handleConfigTyping();
+
+  if (mouseClickedIn(CFG_START_RECT.x, CFG_START_RECT.y, CFG_START_RECT.w, CFG_START_RECT.h)) {
+    commitConfig();
+    difficulty = -1;
+    onlineScreen = 'select';
+  } else if (keyWentDown('r')) {
+    onlineScreen = 'mode';
+  }
+}
+
+// A focusable value box showing the current HP/goal value; click to focus for
+// typing. A focused box is outlined and shows the in-progress digit buffer.
+function drawConfigBox(
+  box: { x: number; y: number; w: number; h: number },
+  value: number,
+  field: 'hp' | 'goal',
+): void {
+  const focused = configFocus === field;
+  fill(focused ? 'rgba(120,200,120,0.30)' : 'rgba(255,255,255,0.10)');
+  rect(box.x, box.y, box.w, box.h);
+  fill('white');
+  textAlign(CENTER, CENTER);
+  textSize(40);
+  const shown = focused && configBuf ? configBuf : String(value);
+  text(shown, box.x + box.w / 2, box.y + box.h / 2);
+  textSize(22);
+  fill('gray');
+  text('custom', box.x + box.w / 2, box.y - 16);
+  if (mouseClickedIn(box.x, box.y, box.w, box.h)) {
+    configFocus = field;
+    configBuf = '';
+  }
+}
+
+// Digit/backspace entry for the focused config box. Clamps to 1–99 and writes
+// straight through to competeHP/competeGoal so the live value tracks typing.
+function handleConfigTyping(): void {
+  if (!configFocus) return;
+  let changed = false;
+  for (let d = 0; d <= 9; d++) {
+    if (keyWentDown(String(d))) {
+      configBuf = (configBuf + d).slice(-2);
+      changed = true;
+    }
+  }
+  if (keyWentDown('backspace')) {
+    configBuf = configBuf.slice(0, -1);
+    changed = true;
+  }
+  if (changed) {
+    const n = configBuf === '' ? 0 : Number.parseInt(configBuf, 10);
+    const clamped = Math.max(1, Math.min(99, n || 1));
+    if (configFocus === 'hp') competeHP = clamped;
+    else competeGoal = clamped;
+  }
+}
+
+// Snap any unfinished typing to a valid value before leaving the config screen.
+function commitConfig(): void {
+  competeHP = Math.max(1, Math.min(99, competeHP || 1));
+  competeGoal = Math.max(1, Math.min(99, competeGoal || 1));
+  configFocus = null;
+  configBuf = '';
+}
+
+// Host difficulty select; on pick, seed and start the configured match.
+function drawHostSelect(): void {
+  drawDifficultySelect();
+  if (difficulty > 0) startMatchHost(true);
 }
 
 // The shared online gameplay tick, run by BOTH clients. The local ship is
@@ -872,21 +1235,46 @@ function drawGameplayOnline(): void {
   coin.scale = 0.4;
 
   // Local ship: live input + physics (zero lag).
-  if (keyWentDown('up')) localShip.velocityY = -12;
+  if (keyWentDown('up')) localShip.velocityY = SHIP_JUMP;
   localShip.velocityX = 0;
-  if (keyDown('left')) localShip.velocityX = -5;
-  if (keyDown('right')) localShip.velocityX = 5;
-  localShip.velocityY += 1.5;
+  if (keyDown('left')) localShip.velocityX = -SHIP_SPEED;
+  if (keyDown('right')) localShip.velocityX = SHIP_SPEED;
+  localShip.velocityY += GRAVITY;
 
-  // Remote ship: placed directly at its last received position (no local
-  // physics) so the host's collision checks see where it really is.
+  // Remote ship: never moved by local physics — we place it explicitly each
+  // tick. With ?smooth=1 we draw a dead-reckoned + smoothed position to hide the
+  // ½-RTT lag; otherwise it snaps to the raw received position (current
+  // behavior). The host re-pins it to the raw position before collision below.
   remoteShip.velocityX = 0;
   remoteShip.velocityY = 0;
-  remoteShip.x = remoteX;
-  remoteShip.y = remoteY;
+  if (remoteSmoothing) {
+    if (predStale < PREDICT_CAP) {
+      predVY += GRAVITY; // mirror the ship's gravity so the predicted arc stays true
+      predX += predVX;
+      predY += predVY;
+      predStale++;
+    }
+    dispX += (predX - dispX) * REMOTE_SMOOTH;
+    dispY += (predY - dispY) * REMOTE_SMOOTH;
+    remoteShip.x = dispX;
+    remoteShip.y = dispY;
+  } else {
+    remoteShip.x = remoteX;
+    remoteShip.y = remoteY;
+  }
 
-  // Tell the other client where we are.
-  session?.send({ t: 'pos', x: Math.round(localShip.x), y: Math.round(localShip.y) });
+  // Tell the other client where we are, how we're moving (for their
+  // dead-reckoning), and our own counters (the opponent's HUD + compete
+  // arbitration). velocityX/Y were just set from this tick's input above.
+  session?.send({
+    t: 'pos',
+    x: Math.round(localShip.x),
+    y: Math.round(localShip.y),
+    vx: localShip.velocityX,
+    vy: localShip.velocityY,
+    hp: health,
+    coins: points,
+  });
 
   // Guest pipes a periodic digest back to the host for the desync log (~2/s).
   // Sent unconditionally — the host decides whether to display it (?debug=1).
@@ -913,11 +1301,19 @@ function drawGameplayOnline(): void {
   for (const b of blocks) drawSprite(b);
 
   textAlign(LEFT, CENTER);
-  textSize(20);
-  fill('red');
-  text(`Health: ${health}`, 300, 20);
-  fill('green');
-  text(`Points: ${points}`, 300, 50);
+  textSize(40);
+  if (matchMode === 'compete') {
+    // Per-player counters: your own (live) and the opponent's (from `pos`).
+    fill('red');
+    text(`You  HP ${health}  ${points}/${winCon}`, 20, 40);
+    fill('aqua');
+    text(`Foe  HP ${oppHealth}  ${oppPoints}/${winCon}`, 20, 100);
+  } else {
+    fill('red');
+    text(`Health: ${health}`, 600, 40);
+    fill('green');
+    text(`Points: ${points}`, 600, 100);
+  }
 
   // Deterministic enemy spawning + cleanup — identical on both via the seed.
   count++;
@@ -927,13 +1323,78 @@ function drawGameplayOnline(): void {
   }
   for (let i = blocks.length - 1; i >= 0; i--) {
     const b = blocks[i];
-    if (b && (b.x < -10 || b.x > 410 || b.y < -10 || b.y > 410)) {
+    if (b && (b.x < -EDGE || b.x > FIELD + EDGE || b.y < -EDGE || b.y > FIELD + EDGE)) {
       b.destroy();
       blocks.splice(i, 1);
     }
   }
 
-  if (isHost) hostAuthoritativeEvents(localShip, remoteShip);
+  if (matchMode === 'compete') {
+    // Each client owns its ship: its own wall/enemy hits and its own (never
+    // contested) coin, resolved purely from local state. Crucially this does
+    // NOT destroy the shared seeded blocks, so both clients keep advancing the
+    // identical wave. The host alone decides the win/loss outcome.
+    competeLocalEvents(localShip);
+    if (isHost) competeArbitrate();
+  } else if (isHost) {
+    // Co-op: coins/damage are host-authoritative and must use the RAW received
+    // position, not the smoothed/predicted one (smoothing is render-only).
+    remoteShip.x = remoteX;
+    remoteShip.y = remoteY;
+    hostAuthoritativeEvents(localShip, remoteShip);
+    if (health === 0 || points >= winCon) onlineScreen = 'end';
+  }
+}
+
+// Compete, run by BOTH clients each tick: resolve the LOCAL ship's own coin and
+// own damage from local state only. No remote dependency, no host round-trip —
+// each player is authoritative over their own ship. Damage deliberately does
+// not clear `blocks` (the seeded wave is shared and must stay identical on both
+// clients); a short cooldown grants brief post-hit invulnerability instead.
+function competeLocalEvents(localShip: Sprite): void {
+  if (!coinExists) placeCoin(); // own independent coin, Math.random-placed
+  if (localShip.isTouching(coin)) {
+    points++;
+    coinExists = false;
+    coin.y = FIELD + 100;
+  }
+
+  if (damageCooldown > 0) damageCooldown--;
+  if (damageCooldown === 0) {
+    let hit = offField(localShip);
+    if (!hit) {
+      for (const b of blocks) {
+        if (b && localShip.isTouching(b)) {
+          hit = true;
+          break;
+        }
+      }
+    }
+    if (hit) {
+      health--;
+      respawnOwnShip();
+      damageCooldown = 15; // ~0.5 s of invulnerability; blocks are NOT cleared
+    }
+  }
+}
+
+// Host only, compete: decide the match outcome from both players' counters and
+// broadcast it. First to the coin goal wins; dropping to 0 HP loses. The host
+// checks its own state first, which breaks a same-tick tie in its favor.
+function competeArbitrate(): void {
+  if (matchResult) return;
+  let winner: 'host' | 'guest' | null = null;
+  if (points >= winCon) winner = 'host';
+  else if (oppPoints >= winCon) winner = 'guest';
+  else if (health <= 0) winner = 'guest';
+  else if (oppHealth <= 0) winner = 'host';
+  if (!winner) return;
+
+  if (winner === 'host') hostWins++;
+  else guestWins++;
+  matchResult = { winner, hostWins, guestWins };
+  onlineScreen = 'end';
+  session?.send({ t: 'result', winner, hostWins, guestWins });
 }
 
 // Host only: the events that depend on BOTH ships and so can't be derived
@@ -983,13 +1444,13 @@ function drawOnlineMenus(): void {
 
 function drawWinOnline(): void {
   fill('green');
-  textSize(70);
+  textSize(140);
   textAlign(CENTER, CENTER);
-  text('You Win!', 200, 150);
+  text('You Win!', MID, 300);
   fill('white');
-  textSize(20);
-  text(`Final Health: ${health}`, 200, 250);
-  text('press C to keep going!', 200, 275);
+  textSize(40);
+  text(`Final Health: ${health}`, MID, 500);
+  text('press C to keep going!', MID, 550);
 }
 
 function hostRestartToSelect(): void {
@@ -1000,14 +1461,74 @@ function hostRestartToSelect(): void {
   nextSpawn = null;
   for (const b of blocks) b.destroy();
   blocks = [];
-  onlineMatchStarted = false;
   difficulty = -1;
+  onlineScreen = 'select';
   session?.send({ t: 'wait' });
 }
 
 function hostContinue(): void {
   winCon += 25;
   startMatchHost(false); // keep score/health, reseed a fresh wave, resume
+}
+
+// Compete match-end screen, rendered by BOTH ends from the host's `result`.
+// Names the winner from each viewer's perspective and shows the session tally.
+// Only the host can act: C rematches (same settings, tally persists), M returns
+// to mode select.
+function drawMatchEnd(): void {
+  const r = matchResult;
+  if (!r) {
+    // Shouldn't happen, but never strand the screen with no result to show.
+    onlineScreen = 'select';
+    return;
+  }
+  const localIsHost = netRole === 'host';
+  const iWon = (r.winner === 'host') === localIsHost;
+  const myWins = localIsHost ? r.hostWins : r.guestWins;
+  const foeWins = localIsHost ? r.guestWins : r.hostWins;
+
+  background('black');
+  textAlign(CENTER, CENTER);
+  fill(iWon ? 'lightgreen' : 'red');
+  textSize(120);
+  text(iWon ? 'You Win!' : 'You Lose', MID, 250);
+
+  fill('white');
+  textSize(50);
+  text('Match wins', MID, 400);
+  text(`You ${myWins}   —   Foe ${foeWins}`, MID, 470);
+
+  if (localIsHost) {
+    fill('aqua');
+    textSize(38);
+    text('Press C for a rematch', MID, 600);
+    fill('gray');
+    textSize(30);
+    text('Press M to change mode', MID, 660);
+    if (keyWentDown('C')) competeContinue();
+    else if (keyWentDown('m')) competeBackToMenu();
+  } else {
+    fill('gray');
+    textSize(34);
+    text('Waiting for host…', MID, 610);
+  }
+}
+
+// Host: start another compete match with the same settings; the win tally
+// carries over (it's session-only state, untouched here).
+function competeContinue(): void {
+  matchResult = null;
+  startMatchHost(true);
+}
+
+// Host: abandon the current compete settings and return to mode select.
+function competeBackToMenu(): void {
+  matchResult = null;
+  difficulty = -1;
+  onlineScreen = 'mode';
+  for (const b of blocks) b.destroy();
+  blocks = [];
+  session?.send({ t: 'wait' });
 }
 
 function copyLink(link: string): void {
@@ -1022,31 +1543,31 @@ function drawHostLobby(): void {
   background('black');
   textAlign(CENTER, CENTER);
   fill('white');
-  textSize(30);
-  text('Online co-op', 200, 50);
+  textSize(60);
+  text('Online co-op', MID, 100);
 
   if (netStatus === 'disconnected') {
     fill('red');
-    textSize(22);
-    text('Player 2 disconnected.', 200, 180);
+    textSize(44);
+    text('Player 2 disconnected.', MID, 360);
     fill('white');
-    textSize(16);
-    text('Press R to return to the menu', 200, 220);
+    textSize(32);
+    text('Press R to return to the menu', MID, 440);
     if (keyWentDown('r')) resetToLocalTitle();
     return;
   }
 
   fill('yellow');
-  textSize(24);
-  text(`Room code: ${roomCode}`, 200, 110);
+  textSize(48);
+  text(`Room code: ${roomCode}`, MID, 220);
 
   fill('white');
-  textSize(14);
-  text('Share this link with player 2:', 200, 160);
+  textSize(28);
+  text('Share this link with player 2:', MID, 320);
   fill('aqua');
-  textSize(11);
+  textSize(22);
   const link = shareLink(roomCode);
-  text(link, 200, 184);
+  text(link, MID, 368);
 
   fill(
     mouseOver(COPY_RECT.x, COPY_RECT.y, COPY_RECT.w, COPY_RECT.h)
@@ -1055,16 +1576,16 @@ function drawHostLobby(): void {
   );
   rect(COPY_RECT.x, COPY_RECT.y, COPY_RECT.w, COPY_RECT.h);
   fill('white');
-  textSize(16);
-  text('Click to copy link', 200, COPY_RECT.y + COPY_RECT.h / 2);
+  textSize(32);
+  text('Click to copy link', MID, COPY_RECT.y + COPY_RECT.h / 2);
   if (mouseClickedIn(COPY_RECT.x, COPY_RECT.y, COPY_RECT.w, COPY_RECT.h)) copyLink(link);
 
   fill('lightgray');
-  textSize(17);
-  text('Waiting for player 2 to join…', 200, 300);
+  textSize(34);
+  text('Waiting for player 2 to join…', MID, 600);
   fill('gray');
-  textSize(13);
-  text('Press R to cancel', 200, 340);
+  textSize(26);
+  text('Press R to cancel', MID, 680);
   if (keyWentDown('r')) resetToLocalTitle();
 }
 
@@ -1072,12 +1593,12 @@ function drawCenterMessage(message: string, sub?: string): void {
   background('black');
   textAlign(CENTER, CENTER);
   fill('white');
-  textSize(26);
-  text(message, 200, 190);
+  textSize(52);
+  text(message, MID, 380);
   if (sub) {
     fill('gray');
-    textSize(15);
-    text(sub, 200, 230);
+    textSize(30);
+    text(sub, MID, 460);
   }
 }
 
@@ -1087,11 +1608,22 @@ function drawGuest(): void {
     if (keyWentDown('r')) resetToLocalTitle();
     return;
   }
+  // Compete: the host's `result` is the single source of truth for the end — the
+  // guest keeps playing until it lands (its own 0-HP/goal is just a local view).
+  if (matchResult) {
+    drawMatchEnd();
+    return;
+  }
   if (!gameStarted) {
     const msg = netStatus === 'connected' ? 'Waiting for host to start…' : 'Connecting to host…';
     drawCenterMessage(msg, `Room ${roomCode}`);
     return;
   }
+  if (matchMode === 'compete') {
+    drawGameplayOnline();
+    return;
+  }
+  // Co-op overlays are derived from the shared health/points.
   if (health <= 0) {
     drawGuestOverlay('Game Over!', 'red', `Score: ${points}`);
     return;
@@ -1106,11 +1638,11 @@ function drawGuest(): void {
 function drawGuestOverlay(title: string, color: string, sub: string): void {
   background('black');
   fill(color);
-  textSize(70);
+  textSize(140);
   textAlign(CENTER, CENTER);
-  text(title, 200, 150);
+  text(title, MID, 300);
   fill('white');
-  textSize(20);
-  text(sub, 200, 250);
-  text('Waiting for host…', 200, 300);
+  textSize(40);
+  text(sub, MID, 500);
+  text('Waiting for host…', MID, 600);
 }

@@ -13,9 +13,14 @@
 // null rather than throwing into the render loop.
 
 // Host → guest. Begins (or, on a win-continue, re-syncs) a match: both sides
-// seed their RNG identically and reset to the same starting state.
+// seed their RNG identically and reset to the same starting state. `mode`
+// selects co-op (shared HP/points, host-authoritative coins/damage) vs compete
+// (per-player HP/coins; each client runs its own ship/coin, host arbitrates only
+// the win/loss outcome). In compete, `health` is the starting HP and `winCon`
+// is the coin goal both players were configured with.
 export interface StartMsg {
   t: 'start';
+  mode: 'coop' | 'compete';
   seed: number;
   difficulty: number;
   health: number;
@@ -25,11 +30,20 @@ export interface StartMsg {
   coinY: number;
 }
 
-// Either direction, every tick: the sender's own ship position.
+// Either direction, every tick: the sender's own ship position and current
+// velocity. Velocity lets the receiver dead-reckon the remote ship forward to
+// hide ½-RTT lag (?smooth=1); it's ignored when smoothing is off. `hp`/`coins`
+// carry the sender's own counters — meaningful in compete (the receiver draws
+// them as the opponent's HUD and the host arbitrates win/loss from them);
+// redundant but harmless in co-op, where HP/points are shared.
 export interface PosMsg {
   t: 'pos';
   x: number;
   y: number;
+  vx: number;
+  vy: number;
+  hp: number;
+  coins: number;
 }
 
 // Host → guest: a coin was collected (by either ship). Carries the new score
@@ -55,6 +69,17 @@ export interface WaitMsg {
   t: 'wait';
 }
 
+// Host → guest, compete only: the host has decided the match outcome (someone
+// hit the coin goal or dropped to 0 HP). Carries the winner and the session win
+// tally for both players so both ends render the same match-end screen. The
+// host is the sole arbiter so the two clients can't disagree under ½-RTT.
+export interface ResultMsg {
+  t: 'result';
+  winner: 'host' | 'guest';
+  hostWins: number;
+  guestWins: number;
+}
+
 // Guest → host, debug only (?debug=1 on the host). A periodic digest of the
 // guest's sim state so the host can render a desync log on one screen instead of
 // diffing two browser consoles. `sigN`/`sigDir`/`sigSprite` are the guest's
@@ -74,7 +99,7 @@ export interface DiagMsg {
   health: number;
 }
 
-export type NetMessage = StartMsg | PosMsg | CoinMsg | DamageMsg | WaitMsg | DiagMsg;
+export type NetMessage = StartMsg | PosMsg | CoinMsg | DamageMsg | WaitMsg | ResultMsg | DiagMsg;
 
 export function encode(msg: NetMessage): string {
   return JSON.stringify(msg);
@@ -90,7 +115,8 @@ export function decode(raw: string): NetMessage | null {
   if (!isRecord(v)) return null;
   switch (v.t) {
     case 'start':
-      return num(v.seed) &&
+      return (v.mode === 'coop' || v.mode === 'compete') &&
+        num(v.seed) &&
         num(v.difficulty) &&
         num(v.health) &&
         num(v.points) &&
@@ -99,6 +125,7 @@ export function decode(raw: string): NetMessage | null {
         num(v.coinY)
         ? {
             t: 'start',
+            mode: v.mode,
             seed: v.seed,
             difficulty: v.difficulty,
             health: v.health,
@@ -109,7 +136,9 @@ export function decode(raw: string): NetMessage | null {
           }
         : null;
     case 'pos':
-      return num(v.x) && num(v.y) ? { t: 'pos', x: v.x, y: v.y } : null;
+      return num(v.x) && num(v.y) && num(v.vx) && num(v.vy) && num(v.hp) && num(v.coins)
+        ? { t: 'pos', x: v.x, y: v.y, vx: v.vx, vy: v.vy, hp: v.hp, coins: v.coins }
+        : null;
     case 'coin':
       return num(v.x) && num(v.y) && num(v.points)
         ? { t: 'coin', x: v.x, y: v.y, points: v.points }
@@ -118,6 +147,10 @@ export function decode(raw: string): NetMessage | null {
       return num(v.health) ? { t: 'damage', health: v.health } : null;
     case 'wait':
       return { t: 'wait' };
+    case 'result':
+      return (v.winner === 'host' || v.winner === 'guest') && num(v.hostWins) && num(v.guestWins)
+        ? { t: 'result', winner: v.winner, hostWins: v.hostWins, guestWins: v.guestWins }
+        : null;
     case 'diag':
       return num(v.tick) &&
         num(v.spawns) &&
