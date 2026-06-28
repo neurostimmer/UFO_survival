@@ -1,7 +1,7 @@
 // Bootstrap: wire the canvas, install input listeners, preload every asset,
 // arm the user-gesture audio unlock, then start the fixed-step game loop.
 
-import { draw, init } from './game';
+import { draw, init, isGamePaused} from './game';
 import {
   advanceSprites,
   attachCanvas,
@@ -52,8 +52,10 @@ async function main(): Promise<void> {
     const ticks = scheduler.advance(dt);
     for (let i = 0; i < ticks; i++) {
       snapshotTick();
-      advanceSprites();
       draw();
+      if(!isGamePaused()) {
+        advanceSprites();
+      }
     }
     requestAnimationFrame(frame);
   };

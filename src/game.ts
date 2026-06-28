@@ -62,6 +62,7 @@ let winCon = 25;
 // PARITY: 1 = single-player, 3 = two-player. The value 2 is intentionally
 // unused in the original; restart and damage logic check `players > 2`.
 let players = 1;
+let gamePaused = false;
 
 // --- Online co-op (deterministic; transport in src/net) ---------------------
 // netRole selects how draw() behaves. 'local' is the original same-keyboard
@@ -103,6 +104,10 @@ function resetDiag(): void {
   spawnCount = 0;
   lastSpawnN = -1;
   hostSpawns.length = 0;
+}
+
+export function isGamePaused() {
+  return gamePaused;
 }
 
 // Remote-ship smoothing (?smooth=1, read per-client in init()). Off → the remote
@@ -267,10 +272,38 @@ export function draw(): void {
     return;
   }
   // Local same-keyboard play.
-  if (health > 0 && points < winCon && difficulty > 0) {
-    drawGameplay();
-  } else {
-    drawNonGameplay();
+  if(keyWentDown('escape')) {
+    gamePaused = !gamePaused;
+
+    if(gamePaused) {
+      drawPauseScreen();
+    }
+  }
+  if(!gamePaused) {
+    if (health > 0 && points < winCon && difficulty > 0) {
+      drawGameplay();
+    } else {
+      drawNonGameplay();
+    }
+  }
+  if (keyWentDown('r')) {
+    // PARITY: original sets health = 11 (one extra HP after restart).
+    health = 11;
+    points = 0;
+    UFO1.y = FIELD + 400;
+    UFO1.velocityY = 0;
+    UFO1.velocityX = 0;
+    if (players > 2) {
+      UFO2.y = FIELD + 400;
+      UFO2.velocityY = 0;
+      UFO2.velocityX = 0;
+    }
+    background(rgb(255, 0, 0, 0.5));
+    winCon = 25;
+    for (const b of blocks) b.destroy();
+    blocks = [];
+    nextSpawn = null;
+    difficulty = -1;
   }
 }
 
@@ -316,8 +349,8 @@ function drawGameplay(): void {
 
   count++;
 
-  // Spawn cadence: 75 frames easy, 50 normal, 25 hard.
-  if (count === 100 - difficulty * 25) {
+  // Spawn cadence: 37 frames easy, 24 normal, 11 hard.
+  if (count === 50 - difficulty * 13) {
     spawnBlock();
     count = 0;
   }
@@ -496,27 +529,6 @@ function drawNonGameplay(): void {
     drawDifficultySelect();
   } else if (difficulty === -2) {
     drawTitle();
-  }
-
-  // R-restart works from any non-gameplay state.
-  if (keyWentDown('r')) {
-    // PARITY: original sets health = 11 (one extra HP after restart).
-    health = 11;
-    points = 0;
-    UFO1.y = FIELD + 400;
-    UFO1.velocityY = 0;
-    UFO1.velocityX = 0;
-    if (players > 2) {
-      UFO2.y = FIELD + 400;
-      UFO2.velocityY = 0;
-      UFO2.velocityX = 0;
-    }
-    background(rgb(255, 0, 0, 0.5));
-    winCon = 25;
-    for (const b of blocks) b.destroy();
-    blocks = [];
-    nextSpawn = null;
-    difficulty = -1;
   }
 }
 
@@ -711,6 +723,20 @@ function drawTitle(): void {
   if (want1P) startGame(false);
   else if (want2P) startGame(true);
   else if (wantOnline) startOnline();
+}
+
+function drawPauseScreen(): void {
+  fill("rgba(255,255,255,.5)");
+  rect(0,0,FIELD,FIELD);
+
+  fill("black");
+  textAlign(CENTER, CENTER);
+
+  textSize(96);
+  text("GAME PAUSED", 400, 340);
+
+  textSize(48);
+  text("Press ESC to unpause", 400, 450);
 }
 
 function handleDamage(): void {
